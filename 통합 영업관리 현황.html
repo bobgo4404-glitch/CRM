@@ -114,7 +114,8 @@
         
         const MASTER_AUTH_DOC = doc(db, "config", "master_auth");
         const MASTER_DEFAULT_SALT = "mcrm_master_salt_v1";
-        const MASTER_DEFAULT_HASH = "042ae00fea87bd800583c39ed322b89bebd27a11819e7990c3889260a5c5f7f6";
+        const MASTER_DEFAULT_HASH = "f02beb045050782f530bfe3b1b6df3e78706ae0d22658c02e513551b5e43b79c";
+        const MASTER_LEGACY_HASH = "042ae00fea87bd800583c39ed322b89bebd27a11819e7990c3889260a5c5f7f6";
 
         const sha256Hex = async (text) => {
             const enc = new TextEncoder().encode(text);
@@ -124,7 +125,16 @@
 
         const ensureMasterAuthDoc = async () => {
             const snap = await getDoc(MASTER_AUTH_DOC);
-            if (snap.exists()) return snap.data();
+            if (snap.exists()) {
+                const data = snap.data();
+                // Auto-migrate legacy default hash (870908) to new default (0908).
+                if ((data?.salt || MASTER_DEFAULT_SALT) === MASTER_DEFAULT_SALT && data?.hash === MASTER_LEGACY_HASH) {
+                    const migrated = { ...data, algorithm: "sha256+s", salt: MASTER_DEFAULT_SALT, hash: MASTER_DEFAULT_HASH, updatedAt: new Date().toISOString() };
+                    await setDoc(MASTER_AUTH_DOC, migrated, { merge: true });
+                    return migrated;
+                }
+                return data;
+            }
 
             const payload = {
                 algorithm: "sha256+s",
@@ -2368,3 +2378,4 @@
     </script>
 </body>
 </html>
+
