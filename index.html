@@ -88,8 +88,8 @@
     <script type="text/babel" data-type="module">
         import { initializeApp, deleteApp } from "firebase/app";
         import { getAnalytics } from "firebase/analytics";
-        import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, signInAnonymously } from "firebase/auth";
-        import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, setDoc, query, orderBy, where, getDocs, getDoc } from "firebase/firestore";
+        import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, EmailAuthProvider, reauthenticateWithCredential, updatePassword } from "firebase/auth";
+        import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, setDoc, query, orderBy, where, getDocs, getDoc, writeBatch, deleteField } from "firebase/firestore";
 
         const { useState, useEffect, useMemo, useRef } = React;
 
@@ -114,7 +114,10 @@
         
         const MASTER_AUTH_DOC = doc(db, "config", "master_auth");
         const MASTER_DEFAULT_SALT = "mcrm_master_salt_v1";
-        const MASTER_DEFAULT_HASH = "042ae00fea87bd800583c39ed322b89bebd27a11819e7990c3889260a5c5f7f6";
+        const MASTER_DEFAULT_HASH = "f02beb045050782f530bfe3b1b6df3e78706ae0d22658c02e513551b5e43b79c";
+        const MASTER_LEGACY_HASH = "042ae00fea87bd800583c39ed322b89bebd27a11819e7990c3889260a5c5f7f6";
+        const USER_PASSWORD_SALT_PREFIX = "mcrm_user_salt_v1";
+        let ADMIN_PROVISION_SEQ = 0;
 
         const sha256Hex = async (text) => {
             const enc = new TextEncoder().encode(text);
@@ -124,7 +127,16 @@
 
         const ensureMasterAuthDoc = async () => {
             const snap = await getDoc(MASTER_AUTH_DOC);
-            if (snap.exists()) return snap.data();
+            if (snap.exists()) {
+                const data = snap.data();
+                // Auto-migrate legacy default hash (870908) to new default (0908).
+                if ((data?.salt || MASTER_DEFAULT_SALT) === MASTER_DEFAULT_SALT && data?.hash === MASTER_LEGACY_HASH) {
+                    const migrated = { ...data, algorithm: "sha256+s", salt: MASTER_DEFAULT_SALT, hash: MASTER_DEFAULT_HASH, updatedAt: new Date().toISOString() };
+                    await setDoc(MASTER_AUTH_DOC, migrated, { merge: true });
+                    return migrated;
+                }
+                return data;
+            }
 
             const payload = {
                 algorithm: "sha256+s",
@@ -142,6 +154,79 @@
             const hash = authData?.hash || MASTER_DEFAULT_HASH;
             const candidate = await sha256Hex(`${salt}:${plainPassword}`);
             return candidate === hash;
+        };
+
+        const buildUserPasswordHash = async (userId, plainPassword) => {
+            const normalizedUserId = String(userId || "").trim().toLowerCase();
+            return sha256Hex(`${USER_PASSWORD_SALT_PREFIX}:${normalizedUserId}:${plainPassword}`);
+        };
+
+        const normalizeRole = (rawRole) => {
+            const role = String(rawRole || "").toLowerCase();
+            if (role === "admin" || role === "master") return "admin";
+            if (role === "user") return "user";
+            return "guest";
+        };
+
+        const resolveApprovedUser = async (firebaseUser) => {
+            if (!firebaseUser?.uid) return null;
+            const approvedRef = doc(db, "approved_users", firebaseUser.uid);
+            const approvedSnap = await getDoc(approvedRef);
+            if (!approvedSnap.exists()) return null;
+
+            const approved = approvedSnap.data() || {};
+            const status = String(approved.status || "").toLowerCase();
+            if (status !== "approved") return null;
+            const role = normalizeRole(approved.role);
+            if (role === "guest") return null;
+
+            const fallbackId = getIdFromEmail(firebaseUser.email || "");
+            const userId = String(approved.userId || fallbackId || "").trim().toLowerCase();
+            let name = approved.name || userId || "사용자";
+            let department = "";
+            let team = "";
+            let position = "";
+            let memberDocId = "";
+            let authUid = firebaseUser.uid;
+            let isActive = true;
+
+            if (userId) {
+                try {
+                    const memberSnap = await getDocs(query(collection(db, "members"), where("userId", "==", userId)));
+                    if (!memberSnap.empty) {
+                        const memberDoc = memberSnap.docs[0];
+                        const memberData = memberDoc.data() || {};
+                        memberDocId = memberDoc.id;
+                        name = memberData.name || name;
+                        department = memberData.department || "";
+                        team = memberData.team || memberData.department || "";
+                        position = memberData.position || "";
+                        authUid = memberData.authUid || authUid;
+                        isActive = memberData.isActive !== false;
+                    }
+                } catch (_) {}
+            }
+
+            if (isActive === false) return null;
+            return { uid: firebaseUser.uid, id: userId, name, role, department, team, position, memberDocId, authUid, isActive };
+        };
+
+        const createAuthUserByAdmin = async (userId, plainPassword, displayName = "") => {
+            const normalizedId = String(userId || "").trim().toLowerCase();
+            const tempName = `mcrm-admin-provision-${Date.now()}-${ADMIN_PROVISION_SEQ++}`;
+            const tempApp = initializeApp(firebaseConfig, tempName);
+            const tempAuth = getAuth(tempApp);
+            const email = getEmailFromId(normalizedId);
+            try {
+                const cred = await createUserWithEmailAndPassword(tempAuth, email, plainPassword);
+                if (displayName) {
+                    await updateProfile(cred.user, { displayName });
+                }
+                return cred.user;
+            } finally {
+                try { await signOut(tempAuth); } catch (_) {}
+                try { await deleteApp(tempApp); } catch (_) {}
+            }
         };
 
         const Icons = {
@@ -177,15 +262,48 @@
             if (number >= 1000000) return (number / 1000000).toFixed(0) + "백만";
             return new Intl.NumberFormat('ko-KR').format(number);
         };
+        const nowIso = () => new Date().toISOString();
+        const todayYmd = () => new Date().toISOString().split('T')[0];
+        const AUDIT_EXCLUDE_FIELDS = new Set([
+            "updatedAt", "updatedBy", "lastEditedAt", "lastEditedBy",
+            "createdAt", "createdBy", "deletedAt", "deletedBy",
+            "lockUpdatedAt", "lockUpdatedBy"
+        ]);
+        const summarizeForAudit = (obj) => {
+            if (!obj || typeof obj !== "object") return obj;
+            const clone = {};
+            Object.keys(obj).forEach((key) => {
+                if (AUDIT_EXCLUDE_FIELDS.has(key)) return;
+                const value = obj[key];
+                if (typeof value === "string" && value.length > 240) clone[key] = `${value.slice(0, 240)}...`;
+                else clone[key] = value;
+            });
+            return clone;
+        };
+        const getChangedFields = (beforeObj = {}, afterObj = {}) => {
+            const changed = [];
+            const keys = Array.from(new Set([...Object.keys(beforeObj || {}), ...Object.keys(afterObj || {})]));
+            keys.forEach((key) => {
+                if (AUDIT_EXCLUDE_FIELDS.has(key)) return;
+                const beforeValue = beforeObj?.[key];
+                const afterValue = afterObj?.[key];
+                if (JSON.stringify(beforeValue) !== JSON.stringify(afterValue)) changed.push(key);
+            });
+            return changed;
+        };
 
         // --- Data Manager ---
         const INITIAL_DATA = {
-            customers: [], members: [], deals: [], issues: [], projects: [], logs: [], snapshots: [],
+            customers: [], members: [], deals: [], issues: [], projects: [], logs: [], snapshots: [], signupRequests: [],
+            deleted: { customers: [], deals: [], issues: [], projects: [], members: [] },
+            editLocks: [],
             settings: {
                 targets: { "2026": 1000000000 },
                 ownerTargets: { "2026": {} },
                 products: ["Hyper-CNC X5", "Tool Parts", "SF-Bridge SW"],
                 departments: ["영업 1팀", "영업 2팀", "기술영업팀", "품질관리팀", "생산관리팀", "설계팀"],
+                teams: ["영업 1팀", "영업 2팀", "기술영업팀", "품질관리팀", "생산관리팀", "설계팀"],
+                positions: ["사원", "주임", "대리", "과장", "차장", "부장"],
                 dealStageSlaDays: { discovery: 14, proposal: 10, negotiation: 14 },
                 projectStatusSlaDays: { plan: 7, design: 10, production: 14, qc: 7 }
             }
@@ -225,60 +343,126 @@
             const [data, setData] = useState(INITIAL_DATA);
             const [isCloudConnected, setIsCloudConnected] = useState(false);
             const isGuest = currentUser?.isGuest;
+            const isMaster = currentUser?.role === 'admin';
+            const currentTeamId = String(currentUser?.team || currentUser?.department || "").trim();
+            const denyMasterAction = () => showToast("권한이 없습니다. 최고관리자만 수행할 수 있습니다.");
+            const denyWriteAction = () => showToast("본인 담당 건만 수정할 수 있습니다.");
+            const lockDocId = (col, id) => `${col}__${id}`;
+            const lockTtlMs = 15 * 60 * 1000;
+            const getDefaultTeam = () => currentTeamId || String(currentUser?.department || "").trim();
+            const getDefaultOwner = () => String(currentUser?.id || "").trim().toLowerCase();
+            const isOwnItem = (item) => String(item?.ownerId || "").trim().toLowerCase() === getDefaultOwner();
+            const canWriteItem = (col, item) => {
+                if (isMaster) return true;
+                if (!item) return false;
+                if (col === "members" || col === "settings") return false;
+                return isOwnItem(item);
+            };
 
             useEffect(() => {
-                // Anonymous auth to connect to Firebase
-                signInAnonymously(auth).then(() => console.log("System Connected")).catch(console.error);
-
                 const unsubs = [];
-                const collections = ["customers", "members", "deals", "issues", "projects", "snapshots"]; 
-                collections.forEach(col => {
-                    const q = col === "issues" ? query(collection(db, col), orderBy("date", "desc")) : collection(db, col);
-                    unsubs.push(onSnapshot(q, (snap) => {
-                        const items = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                        setData(prev => ({ ...prev, [col]: items }));
-                        if(col === "customers") setIsCloudConnected(true);
-                    }, () => setIsCloudConnected(false)));
-                });
-                
-                // Fetch logs only if master
-                if (currentUser?.id === 'master') {
-                    const logQuery = query(collection(db, "logs"), orderBy("timestamp", "desc"));
-                    unsubs.push(onSnapshot(logQuery, (snap) => {
-                        const logs = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                        setData(prev => ({ ...prev, logs }));
-                    }));
+                if (!currentUser) {
+                    setData(prev => ({ ...INITIAL_DATA, settings: prev.settings || INITIAL_DATA.settings }));
+                    return () => unsubs.forEach(u => u());
                 }
 
                 unsubs.push(onSnapshot(doc(db, "config", "settings"), (snap) => {
                     if (snap.exists()) {
                         const s = snap.data() || {};
+                        const normalizedDepartments = Array.from(new Set([
+                            ...((Array.isArray(s.departments) ? s.departments : [])),
+                            ...((Array.isArray(s.teams) ? s.teams : []))
+                        ].map((v) => String(v || "").trim()).filter(Boolean)));
+                        const mergedDepartments = normalizedDepartments.length
+                            ? normalizedDepartments
+                            : [...INITIAL_DATA.settings.departments];
                         setData(prev => ({
                             ...prev,
                             settings: {
                                 ...INITIAL_DATA.settings,
                                 ...s,
+                                departments: mergedDepartments,
+                                teams: mergedDepartments,
                                 ownerTargets: s.ownerTargets || {}
                             }
                         }));
+                        setIsCloudConnected(true);
                     }
-                    else setDoc(doc(db, "config", "settings"), INITIAL_DATA.settings);
+                    else if (isMaster) {
+                        setDoc(doc(db, "config", "settings"), INITIAL_DATA.settings);
+                    }
+                }, () => setIsCloudConnected(false)));
+
+                if (currentUser?.isGuest) {
+                    setData(prev => ({ ...INITIAL_DATA, settings: prev.settings || INITIAL_DATA.settings }));
+                    return () => unsubs.forEach(u => u());
+                }
+
+                const collections = ["customers", "members", "deals", "issues", "projects", "snapshots"]; 
+                collections.forEach(col => {
+                    const q = col === "issues" ? query(collection(db, col), orderBy("date", "desc")) : collection(db, col);
+                    unsubs.push(onSnapshot(q, (snap) => {
+                        const itemsAll = snap.docs.map(doc => {
+                            const raw = { id: doc.id, ...doc.data() };
+                            if (col === "members") {
+                                const { password, passwordHash, ...safeMember } = raw;
+                                return safeMember;
+                            }
+                            return raw;
+                        });
+                        const activeItems = itemsAll.filter((item) => item.isDeleted !== true);
+                        const deletedItems = itemsAll.filter((item) => item.isDeleted === true);
+                        setData(prev => ({
+                            ...prev,
+                            [col]: activeItems,
+                            deleted: { ...(prev.deleted || {}), [col]: deletedItems }
+                        }));
+                        if(col === "customers") setIsCloudConnected(true);
+                    }, () => setIsCloudConnected(false)));
+                });
+
+                unsubs.push(onSnapshot(collection(db, "edit_locks"), (snap) => {
+                    const nowMs = Date.now();
+                    const locks = snap.docs
+                        .map((lockDoc) => ({ id: lockDoc.id, ...lockDoc.data() }))
+                        .filter((item) => {
+                            const expires = new Date(item.expiresAt || 0).getTime();
+                            return Number.isFinite(expires) && expires > nowMs;
+                        });
+                    setData((prev) => ({ ...prev, editLocks: locks }));
                 }));
+                 
+                // Fetch logs only if admin
+                if (isMaster) {
+                    const logQuery = query(collection(db, "logs"), orderBy("timestamp", "desc"));
+                    unsubs.push(onSnapshot(logQuery, (snap) => {
+                        const logs = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        setData(prev => ({ ...prev, logs }));
+                    }));
+
+                    unsubs.push(onSnapshot(collection(db, "signup_requests"), (snap) => {
+                        const signupRequests = snap.docs
+                            .map((requestDoc) => ({ id: requestDoc.id, ...requestDoc.data() }))
+                            .sort((a, b) => String(b.requestedAt || "").localeCompare(String(a.requestedAt || "")));
+                        setData((prev) => ({ ...prev, signupRequests }));
+                    }));
+                }
                 return () => unsubs.forEach(u => u());
             }, [currentUser]);
 
             // Logger function
-            const logAction = async (action, collectionName, itemId, detail) => {
+            const logAction = async (action, collectionName, itemId, detail, meta = {}) => {
                 if (isGuest || !currentUser) return;
                 try {
                     await addDoc(collection(db, "logs"), {
-                        timestamp: new Date().toISOString(),
-                        action, 
+                        timestamp: nowIso(),
+                        action,
                         collection: collectionName,
                         itemId,
                         detail,
                         userId: currentUser.id,
-                        userName: currentUser.name
+                        userName: currentUser.name,
+                        ...meta
                     });
                 } catch (e) {
                     console.error("Log failed", e);
@@ -329,83 +513,259 @@
             };
 
             const crud = (col) => ({
-                add: async (item) => { 
-                    if(isGuest) return;
+                add: async (item) => {
+                    if (isGuest) return;
+                    if (col === 'members' && !isMaster) {
+                        denyMasterAction();
+                        return;
+                    }
                     try {
-                        let data = { ...item, ...(col === 'deals' ? {lastUpdateDate: new Date().toISOString().split('T')[0]} : {date: new Date().toISOString().split('T')[0]}) };
+                        const actor = currentUser?.id || 'system';
+                        const actorTeam = getDefaultTeam();
+                        const createdAt = nowIso();
+                        let payload = {
+                            ...item,
+                            ...(col === 'deals' ? { lastUpdateDate: todayYmd() } : { date: todayYmd() }),
+                            ownerId: item?.ownerId || actor,
+                            teamId: item?.teamId || actorTeam || '',
+                            isDeleted: false,
+                            createdAt,
+                            createdBy: actor,
+                            updatedAt: createdAt,
+                            updatedBy: actor,
+                            lastEditedAt: createdAt,
+                            lastEditedBy: actor
+                        };
                         if (col === 'deals') {
-                            const prob = calibrateDealProbability(data);
-                            data = { ...data, ...prob };
-                            data.stageHistory = [{ stage: data.stage || 'discovery', date: data.lastUpdateDate, actor: currentUser?.id || 'system' }];
+                            const prob = calibrateDealProbability(payload);
+                            payload = { ...payload, ...prob };
+                            payload.stageHistory = [{ stage: payload.stage || 'discovery', date: payload.lastUpdateDate, actor }];
                         }
                         if (col === 'projects') {
-                            data.statusHistory = [{ status: data.status || 'plan', date: new Date().toISOString().split('T')[0], actor: currentUser?.id || 'system' }];
+                            payload.statusHistory = [{ status: payload.status || 'plan', date: todayYmd(), actor }];
                         }
-                        const docRef = await addDoc(collection(db, col), data); 
-                        
+                        if (col === 'members') {
+                            payload = { ...payload, isActive: payload.isActive !== false };
+                        }
+
+                        const docRef = await addDoc(collection(db, col), payload);
                         const itemName = item.title || item.name || '항목';
-                        await logAction('create', col, docRef.id, `[${getColName(col)}] '${itemName}' 등록`);
-                        
-                        showToast("등록되었습니다."); 
+                        await logAction('create', col, docRef.id, `[${getColName(col)}] '${itemName}' 등록`, {
+                            changedFields: Object.keys(payload).filter((key) => !AUDIT_EXCLUDE_FIELDS.has(key)),
+                            after: summarizeForAudit(payload)
+                        });
+                        showToast("등록되었습니다.");
                     } catch (e) {
                         console.error(`[CRUD add:${col}]`, e);
                         showToast("등록 실패");
                     }
                 },
-                update: async (item) => { 
-                    if(isGuest) return;
+                update: async (item) => {
+                    if (isGuest) return;
+                    if (col === 'members' && !isMaster) {
+                        denyMasterAction();
+                        return;
+                    }
                     try {
-                        const { id, ...rest } = item; 
-                        let payload = col === 'deals' ? { ...rest, lastUpdateDate: new Date().toISOString().split('T')[0] } : rest;
+                        const { id, ...rest } = item;
+                        const before = (data[col] || []).find((entry) => entry.id === id);
+                        if (!before) {
+                            showToast("수정 대상을 찾을 수 없습니다.");
+                            return;
+                        }
+                        if (!canWriteItem(col, before)) {
+                            denyWriteAction();
+                            return;
+                        }
+                        let payload = col === 'deals' ? { ...rest, lastUpdateDate: todayYmd() } : rest;
                         if (col === 'deals') {
                             const prob = calibrateDealProbability(payload);
                             payload = { ...payload, ...prob };
-                            const current = (data.deals || []).find(d => d.id === id) || {};
-                            payload.stageHistory = current.stageHistory || payload.stageHistory || [];
+                            payload.stageHistory = before.stageHistory || payload.stageHistory || [];
                         }
                         if (col === 'projects') {
-                            const current = (data.projects || []).find(p => p.id === id) || {};
-                            payload.statusHistory = current.statusHistory || payload.statusHistory || [];
+                            payload.statusHistory = before.statusHistory || payload.statusHistory || [];
                         }
-                        await updateDoc(doc(db, col, id), payload); 
-                        
+
+                        const updatedAt = nowIso();
+                        payload = {
+                            ...payload,
+                            ownerId: before.ownerId || payload.ownerId || getDefaultOwner(),
+                            teamId: before.teamId || payload.teamId || getDefaultTeam(),
+                            updatedAt,
+                            updatedBy: currentUser?.id || 'system',
+                            lastEditedAt: updatedAt,
+                            lastEditedBy: currentUser?.id || 'system'
+                        };
+                        await updateDoc(doc(db, col, id), payload);
+
+                        const after = { ...before, ...payload };
+                        const changedFields = getChangedFields(before, after);
                         const itemName = item.title || item.name || '항목';
-                        await logAction('update', col, id, `[${getColName(col)}] '${itemName}' 정보 수정`);
-                        
-                        showToast("수정되었습니다."); 
+                        await logAction('update', col, id, `[${getColName(col)}] '${itemName}' 정보 수정`, {
+                            changedFields,
+                            before: summarizeForAudit(before),
+                            after: summarizeForAudit(after)
+                        });
+
+                        showToast("수정되었습니다.");
                     } catch (e) {
                         console.error(`[CRUD update:${col}]`, e);
                         showToast("수정 실패");
                     }
                 },
-                delete: async (id) => { 
-                    if(isGuest) return;
-                    const target = data[col].find(i => i.id === id);
+                delete: async (id) => {
+                    if (isGuest) return;
+                    if (col === 'members' && !isMaster) {
+                        denyMasterAction();
+                        return;
+                    }
+                    const target = (data[col] || []).find((entry) => entry.id === id);
                     const itemName = target ? (target.title || target.name) : '항목';
+                    if (target && !canWriteItem(col, target)) {
+                        denyWriteAction();
+                        return;
+                    }
 
-                    if(window.confirm(`[${itemName}] 을(를) 삭제하시겠습니까?`)) { 
+                    if (window.confirm(`[${itemName}] 을(를) 삭제하시겠습니까?\n(복구 가능한 소프트 삭제)`)) {
                         try {
-                            await deleteDoc(doc(db, col, id)); 
-                            await logAction('delete', col, id, `[${getColName(col)}] '${itemName}' 삭제`);
-                            showToast("삭제되었습니다."); 
+                            const deletedAt = nowIso();
+                            const deletedBy = currentUser?.id || 'system';
+                            await updateDoc(doc(db, col, id), {
+                                isDeleted: true,
+                                deletedAt,
+                                deletedBy,
+                                updatedAt: deletedAt,
+                                updatedBy: deletedBy,
+                                lastEditedAt: deletedAt,
+                                lastEditedBy: deletedBy
+                            });
+                            await logAction('soft_delete', col, id, `[${getColName(col)}] '${itemName}' 소프트 삭제`, {
+                                before: summarizeForAudit(target),
+                                after: summarizeForAudit({ ...(target || {}), isDeleted: true, deletedAt, deletedBy }),
+                                changedFields: ['isDeleted', 'deletedAt', 'deletedBy']
+                            });
+                            showToast("삭제되었습니다. (복구 가능)");
                         } catch (e) {
                             console.error(`[CRUD delete:${col}]`, e);
                             showToast("삭제 실패");
                         }
-                    } 
+                    }
                 }
             });
+
+            const restoreSoftDeletedItem = async (col, id) => {
+                if (isGuest || !isMaster) { denyMasterAction(); return; }
+                try {
+                    const deletedItem = ((data.deleted || {})[col] || []).find((entry) => entry.id === id);
+                    if (!deletedItem) {
+                        showToast("복구 대상을 찾을 수 없습니다.");
+                        return;
+                    }
+                    const restoredAt = nowIso();
+                    await updateDoc(doc(db, col, id), {
+                        isDeleted: false,
+                        deletedAt: deleteField(),
+                        deletedBy: deleteField(),
+                        updatedAt: restoredAt,
+                        updatedBy: currentUser?.id || 'system',
+                        lastEditedAt: restoredAt,
+                        lastEditedBy: currentUser?.id || 'system'
+                    });
+                    await logAction('restore', col, id, `[${getColName(col)}] '${deletedItem.title || deletedItem.name || id}' 복구`, {
+                        changedFields: ['isDeleted'],
+                        before: summarizeForAudit(deletedItem),
+                        after: summarizeForAudit({ ...deletedItem, isDeleted: false })
+                    });
+                    showToast("복구되었습니다.");
+                } catch (e) {
+                    console.error("[restoreSoftDeletedItem]", e);
+                    showToast("복구 중 오류가 발생했습니다.");
+                }
+            };
+
+            const acquireEditLock = async (col, id) => {
+                if (!currentUser || isGuest || !col || !id) return { ok: false, message: "잠금 대상이 올바르지 않습니다." };
+                const lockId = lockDocId(col, id);
+                const lockRef = doc(db, "edit_locks", lockId);
+                const nowMs = Date.now();
+                try {
+                    const snap = await getDoc(lockRef);
+                    if (snap.exists()) {
+                        const lockData = snap.data() || {};
+                        const expiresMs = new Date(lockData.expiresAt || 0).getTime();
+                        const sameUser = String(lockData.userId || "").toLowerCase() === String(currentUser.id || "").toLowerCase();
+                        if (Number.isFinite(expiresMs) && expiresMs > nowMs && !sameUser) {
+                            return { ok: false, message: `${lockData.userName || lockData.userId || "다른 사용자"}님이 편집 중입니다.` };
+                        }
+                    }
+                    const expiresAt = new Date(nowMs + lockTtlMs).toISOString();
+                    await setDoc(lockRef, {
+                        collection: col,
+                        itemId: id,
+                        uid: currentUser?.uid || "",
+                        userId: currentUser?.id || "",
+                        userName: currentUser?.name || currentUser?.id || "사용자",
+                        teamId: getDefaultTeam(),
+                        acquiredAt: nowIso(),
+                        expiresAt
+                    }, { merge: true });
+                    return { ok: true };
+                } catch (e) {
+                    console.error("[acquireEditLock]", e);
+                    return { ok: false, message: "편집 잠금을 획득하지 못했습니다." };
+                }
+            };
+
+            const releaseEditLock = async (col, id) => {
+                if (!currentUser || !col || !id) return;
+                const lockId = lockDocId(col, id);
+                const lockRef = doc(db, "edit_locks", lockId);
+                try {
+                    const snap = await getDoc(lockRef);
+                    if (!snap.exists()) return;
+                    const lockData = snap.data() || {};
+                    const sameUser = String(lockData.userId || "").toLowerCase() === String(currentUser.id || "").toLowerCase();
+                    if (sameUser || isMaster) {
+                        await deleteDoc(lockRef);
+                    }
+                } catch (e) {
+                    console.error("[releaseEditLock]", e);
+                }
+            };
 
             const updateDealStage = async (id, stage) => { 
                 if(isGuest) return;
                 try {
                     const deal = data.deals.find(d => d.id === id);
+                    if (!deal) {
+                        showToast("대상을 찾을 수 없습니다.");
+                        return;
+                    }
+                    if (!canWriteItem('deals', deal)) {
+                        denyWriteAction();
+                        return;
+                    }
                     const dealTitle = deal ? deal.title : '계약';
-                    const merged = { ...(deal || {}), stage, lastUpdateDate: new Date().toISOString().split('T')[0] };
+                    const merged = { ...(deal || {}), stage, lastUpdateDate: todayYmd() };
                     const prob = calibrateDealProbability(merged);
                     const stageHistory = [ ...(deal?.stageHistory || []), { stage, date: merged.lastUpdateDate, actor: currentUser?.id || 'system' } ].slice(-20);
-                    await updateDoc(doc(db, "deals", id), { stage, lastUpdateDate: merged.lastUpdateDate, ...prob, stageHistory }); 
-                    await logAction('update', 'deals', id, `[계약] '${dealTitle}' 단계 변경: ${stage}`);
+                    const updatedAt = nowIso();
+                    await updateDoc(doc(db, "deals", id), {
+                        stage,
+                        lastUpdateDate: merged.lastUpdateDate,
+                        ...prob,
+                        stageHistory,
+                        updatedAt,
+                        updatedBy: currentUser?.id || 'system',
+                        lastEditedAt: updatedAt,
+                        lastEditedBy: currentUser?.id || 'system'
+                    });
+                    await logAction('update', 'deals', id, `[계약] '${dealTitle}' 단계 변경: ${stage}`, {
+                        changedFields: ['stage', 'probability', 'probabilityRule'],
+                        before: summarizeForAudit(deal),
+                        after: summarizeForAudit({ ...deal, stage, ...prob })
+                    });
                     
                     if (stage === 'closed' && deal) {
                         const projectQuery = query(collection(db, "projects"), where("dealId", "==", id));
@@ -417,11 +777,20 @@
                                 customerId: deal.customerId,
                                 product: deal.product,
                                 status: 'plan', 
-                                startDate: new Date().toISOString().split('T')[0],
+                                startDate: todayYmd(),
                                 dueDate: '',
                                 assigneeId: '', 
                                 priority: 'Normal',
-                                notes: '영업 수주 자동 연동'
+                                notes: '영업 수주 자동 연동',
+                                ownerId: deal.ownerId || currentUser?.id || '',
+                                teamId: deal.teamId || getDefaultTeam(),
+                                isDeleted: false,
+                                createdAt: nowIso(),
+                                createdBy: currentUser?.id || 'system',
+                                updatedAt: nowIso(),
+                                updatedBy: currentUser?.id || 'system',
+                                lastEditedAt: nowIso(),
+                                lastEditedBy: currentUser?.id || 'system'
                             });
                             await logAction('create', 'projects', projRef.id, `[프로젝트] '${deal.title}' 자동 생성 (수주 연동)`);
                             showToast("수주 완료! 생산/납품 프로세스가 자동 시작됩니다.");
@@ -441,12 +810,32 @@
                 if(isGuest) return;
                 try {
                     const project = data.projects.find(p => p.id === id);
+                    if (!project) {
+                        showToast("대상을 찾을 수 없습니다.");
+                        return;
+                    }
+                    if (!canWriteItem('projects', project)) {
+                        denyWriteAction();
+                        return;
+                    }
                     const projectTitle = project ? project.title : '프로젝트';
                     
-                    const today = new Date().toISOString().split('T')[0];
+                    const today = todayYmd();
                     const statusHistory = [ ...(project?.statusHistory || []), { status, date: today, actor: currentUser?.id || 'system' } ].slice(-20);
-                    await updateDoc(doc(db, "projects", id), { status, statusHistory });
-                    await logAction('update', 'projects', id, `[프로젝트] '${projectTitle}' 공정 변경 -> ${status}`);
+                    const updatedAt = nowIso();
+                    await updateDoc(doc(db, "projects", id), {
+                        status,
+                        statusHistory,
+                        updatedAt,
+                        updatedBy: currentUser?.id || 'system',
+                        lastEditedAt: updatedAt,
+                        lastEditedBy: currentUser?.id || 'system'
+                    });
+                    await logAction('update', 'projects', id, `[프로젝트] '${projectTitle}' 공정 변경 -> ${status}`, {
+                        changedFields: ['status'],
+                        before: summarizeForAudit(project),
+                        after: summarizeForAudit({ ...project, status })
+                    });
                     showToast("공정 단계가 변경되었습니다.");
                 } catch (e) {
                     console.error("[updateProjectStatus]", e);
@@ -455,19 +844,30 @@
             };
 
             const updateSettings = async (settings) => { 
-                if(isGuest) return;
+                if(isGuest || !isMaster) { denyMasterAction(); return false; }
                 try {
-                    await setDoc(doc(db, "config", "settings"), settings); 
+                    const normalizedDepartments = Array.from(new Set([
+                        ...((Array.isArray(settings?.departments) ? settings.departments : [])),
+                        ...((Array.isArray(settings?.teams) ? settings.teams : []))
+                    ].map((v) => String(v || "").trim()).filter(Boolean)));
+                    const payload = {
+                        ...settings,
+                        departments: normalizedDepartments,
+                        teams: normalizedDepartments
+                    };
+                    await setDoc(doc(db, "config", "settings"), payload); 
                     await logAction('update', 'settings', 'config', '환경설정 데이터 수정');
                     showToast("설정이 저장되었습니다."); 
+                    return true;
                 } catch (e) {
                     console.error("[updateSettings]", e);
                     showToast("설정 저장 실패");
+                    return false;
                 }
             };
 
             const backupAllData = () => {
-                if(isGuest) return;
+                if(isGuest || !isMaster) { denyMasterAction(); return; }
                 const backupData = {
                     metadata: {
                         exportedBy: 'Master',
@@ -476,10 +876,11 @@
                     },
                     data: {
                         customers: data.customers,
-                        members: data.members,
+                        members: data.members.map(({ password, passwordHash, ...safeMember }) => safeMember),
                         deals: data.deals,
                         projects: data.projects,
                         issues: data.issues,
+                        deleted: data.deleted || {},
                         settings: data.settings,
                         logs: data.logs
                     }
@@ -494,57 +895,375 @@
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
+                URL.revokeObjectURL(url);
                 
                 logAction('backup', 'system', 'all', '전체 데이터 백업 파일 다운로드');
                 showToast("데이터 백업 파일이 생성되었습니다.");
             };
 
             const updateMemberPassword = async (id, newPassword) => {
-                if (isGuest) return;
-                if (!newPassword) return;
-                
-                const member = data.members.find(m => m.id === id);
-                const memberName = member ? member.name : id;
+                if (isGuest || !isMaster) { denyMasterAction(); return; }
+                showToast("보안 정책 변경으로 비밀번호 직접 변경이 비활성화되었습니다. Firebase Auth 재설정 기능을 사용해 주세요.");
+            };
 
+            const changeMyPassword = async (currentPassword, newPassword) => {
+                if (!currentUser || isGuest) {
+                    return { ok: false, message: "로그인 후 사용해 주세요." };
+                }
+                const currentPlain = String(currentPassword || "");
+                const nextPlain = String(newPassword || "");
+                if (!currentPlain || !nextPlain) {
+                    return { ok: false, message: "현재 비밀번호와 새 비밀번호를 입력해 주세요." };
+                }
+                if (nextPlain.length < 6) {
+                    return { ok: false, message: "새 비밀번호는 6자 이상이어야 합니다." };
+                }
                 try {
-                    await updateDoc(doc(db, "members", id), { password: newPassword });
-                    await logAction('update', 'users', id, `[사용자] '${memberName}' 비밀번호 변경 (by Master)`);
-                    showToast("비밀번호가 성공적으로 변경되었습니다.");
+                    const firebaseUser = auth.currentUser;
+                    if (!firebaseUser) {
+                        return { ok: false, message: "인증 세션이 만료되었습니다. 다시 로그인해 주세요." };
+                    }
+                    const email = firebaseUser.email || getEmailFromId(currentUser?.id || "");
+                    if (!email) {
+                        return { ok: false, message: "인증 이메일 정보를 찾을 수 없습니다." };
+                    }
+                    const credential = EmailAuthProvider.credential(email, currentPlain);
+                    await reauthenticateWithCredential(firebaseUser, credential);
+                    await updatePassword(firebaseUser, nextPlain);
+                    try {
+                        await logAction('update', 'users', currentUser.id, '[보안] 본인 비밀번호 변경');
+                    } catch (_) {}
+                    showToast("비밀번호가 변경되었습니다.");
+                    return { ok: true };
                 } catch (e) {
-                    console.error(e);
-                    showToast("비밀번호 변경 실패");
+                    console.error("[changeMyPassword]", e);
+                    const msg = String(e?.message || "");
+                    if (msg.includes("auth/wrong-password") || msg.includes("auth/invalid-credential")) {
+                        return { ok: false, message: "현재 비밀번호가 올바르지 않습니다." };
+                    }
+                    if (msg.includes("auth/weak-password")) {
+                        return { ok: false, message: "새 비밀번호가 너무 약합니다. 6자 이상으로 설정해 주세요." };
+                    }
+                    if (msg.includes("auth/requires-recent-login")) {
+                        return { ok: false, message: "보안을 위해 다시 로그인한 후 시도해 주세요." };
+                    }
+                    return { ok: false, message: "비밀번호 변경 중 오류가 발생했습니다." };
                 }
             };
 
-            const masterCreateUser = async (id, password, name, department, position) => {
-                if(isGuest) return;
+            const masterCreateUser = async (id, password, name, department, team, position) => {
+                if(isGuest || !isMaster) { denyMasterAction(); return; }
                 try {
-                    const q = query(collection(db, "members"), where("userId", "==", id));
-                    const snap = await getDocs(q);
+                    const normalizedId = String(id || '').trim().toLowerCase();
+                    const rawId = String(id || '').trim();
+                    const plainPassword = String(password || '');
+                    if (!normalizedId || plainPassword.length < 6) {
+                        showToast("아이디와 비밀번호(6자 이상)를 확인해 주세요.");
+                        return;
+                    }
+                    const normalizedDept = String(department || '').trim();
+                    const normalizedTeam = String(team || '').trim();
+                    const normalizedPos = String(position || '').trim();
+                    const allowedDepartments = data.settings?.departments || INITIAL_DATA.settings.departments;
+                    const allowedTeams = data.settings?.departments || INITIAL_DATA.settings.departments;
+                    const allowedPositions = data.settings?.positions || INITIAL_DATA.settings.positions;
+                    if (!allowedDepartments.includes(normalizedDept) || !allowedTeams.includes(normalizedTeam) || !allowedPositions.includes(normalizedPos)) {
+                        showToast("부서/팀/직급 설정값을 선택해 주세요.");
+                        return;
+                    }
+                    const email = getEmailFromId(normalizedId);
+                    let snap = await getDocs(query(collection(db, "members"), where("userId", "==", normalizedId)));
+                    if (snap.empty && rawId && rawId !== normalizedId) {
+                        snap = await getDocs(query(collection(db, "members"), where("userId", "==", rawId)));
+                    }
                     if(!snap.empty) {
                         showToast("이미 존재하는 아이디입니다.");
                         return;
                     }
 
+                    const createdAuthUser = await createAuthUserByAdmin(normalizedId, plainPassword, String(name || "").trim());
+                    const approvedRef = doc(db, "approved_users", createdAuthUser.uid);
+                    await setDoc(approvedRef, {
+                        userId: normalizedId,
+                        role: "user",
+                        name: String(name || "").trim(),
+                        approvedAt: new Date().toISOString(),
+                        approvedBy: currentUser?.id || "master",
+                        status: "approved"
+                    }, { merge: true });
+
                     await addDoc(collection(db, "members"), {
-                        userId: id,
-                        password: password, 
+                        userId: normalizedId,
+                        authUid: createdAuthUser.uid,
                         name,
-                        department,
-                        position,
-                        email: `${id}@m-crm.local`,
+                        department: normalizedDept,
+                        team: normalizedTeam,
+                        position: normalizedPos,
+                        email,
+                        isActive: true,
                         color: 'bg-slate-500' 
                     });
-                    await logAction('create', 'users', id, `[사용자] 신규 계정 생성: ${name}(${id})`);
+                    await logAction('create', 'users', normalizedId, `[사용자] 신규 계정 생성: ${name}(${normalizedId})`);
                     showToast("새로운 사용자 계정이 생성되었습니다.");
                 } catch (error) {
                     console.error("Account creation failed:", error);
-                    showToast("계정 생성 실패");
+                    const msg = String(error?.message || "");
+                    if (msg.includes("auth/email-already-in-use")) showToast("이미 존재하는 로그인 계정입니다.");
+                    else if (msg.includes("auth/weak-password")) showToast("비밀번호가 너무 약합니다. 6자 이상으로 설정해 주세요.");
+                    else showToast("계정 생성 실패");
+                }
+            };
+
+            const signUpRequest = async ({ id, password, name, department, team, position }) => {
+                const normalizedId = String(id || '').trim().toLowerCase();
+                const plainPassword = String(password || '');
+                const normalizedName = String(name || '').trim();
+                const normalizedDept = String(department || '').trim();
+                const normalizedTeam = String(team || '').trim();
+                const normalizedPos = String(position || '').trim();
+
+                if (!normalizedId || !normalizedName) {
+                    return { ok: false, message: "이름과 아이디를 입력해 주세요." };
+                }
+                if (plainPassword.length < 6) {
+                    return { ok: false, message: "비밀번호는 6자 이상이어야 합니다." };
+                }
+                if (!normalizedDept || !normalizedTeam || !normalizedPos) {
+                    return { ok: false, message: "부서/팀/직급을 선택해 주세요." };
+                }
+                const allowedDepartments = data.settings?.departments || INITIAL_DATA.settings.departments;
+                const allowedTeams = data.settings?.departments || INITIAL_DATA.settings.departments;
+                const allowedPositions = data.settings?.positions || INITIAL_DATA.settings.positions;
+                if (!allowedDepartments.includes(normalizedDept) || !allowedTeams.includes(normalizedTeam) || !allowedPositions.includes(normalizedPos)) {
+                    return { ok: false, message: "유효한 부서/팀/직급을 선택해 주세요." };
+                }
+
+                try {
+                    const email = getEmailFromId(normalizedId);
+                    const credential = await createUserWithEmailAndPassword(auth, email, plainPassword);
+                    if (normalizedName) {
+                        try { await updateProfile(credential.user, { displayName: normalizedName }); } catch (_) {}
+                    }
+
+                    await setDoc(doc(db, "signup_requests", credential.user.uid), {
+                        authUid: credential.user.uid,
+                        userId: normalizedId,
+                        name: normalizedName,
+                        department: normalizedDept,
+                        team: normalizedTeam,
+                        position: normalizedPos,
+                        status: "pending",
+                        requestedAt: new Date().toISOString(),
+                        reviewedAt: "",
+                        reviewedBy: "",
+                        rejectReason: ""
+                    }, { merge: true });
+
+                    await signOut(auth);
+
+                    showToast("회원가입 신청이 접수되었습니다. 관리자 승인 후 로그인할 수 있습니다.");
+                    return { ok: true };
+                } catch (e) {
+                    console.error("[signUpRequest]", e);
+                    const msg = String(e?.message || "");
+                    if (msg.includes("auth/email-already-in-use")) return { ok: false, message: "이미 사용 중인 아이디입니다." };
+                    if (msg.includes("auth/weak-password")) return { ok: false, message: "비밀번호가 너무 약합니다. 6자 이상으로 설정해 주세요." };
+                    return { ok: false, message: "가입 신청 중 오류가 발생했습니다." };
+                }
+            };
+
+            const approveSignUpRequest = async (requestItem) => {
+                if (isGuest || !isMaster) { denyMasterAction(); return; }
+                if (!requestItem?.id || !requestItem?.userId) {
+                    showToast("요청 데이터가 올바르지 않습니다.");
+                    return;
+                }
+                if ((requestItem.status || "pending") !== "pending") {
+                    showToast("이미 처리된 요청입니다.");
+                    return;
+                }
+
+                try {
+                    const normalizedId = String(requestItem.userId || '').trim().toLowerCase();
+                    const authUid = String(requestItem.authUid || requestItem.id || "").trim();
+                    if (!authUid) {
+                        showToast("요청 authUid가 없어 승인할 수 없습니다.");
+                        return;
+                    }
+                    const existing = await getDocs(query(collection(db, "members"), where("userId", "==", normalizedId)));
+                    if (existing.empty) {
+                        await addDoc(collection(db, "members"), {
+                            authUid,
+                            userId: normalizedId,
+                            name: requestItem.name || normalizedId,
+                            department: requestItem.department || "",
+                            team: requestItem.team || requestItem.department || "",
+                            position: requestItem.position || "",
+                            email: getEmailFromId(normalizedId),
+                            isActive: true,
+                            color: "bg-slate-500"
+                        });
+                    } else {
+                        await updateDoc(doc(db, "members", existing.docs[0].id), {
+                            authUid,
+                            name: requestItem.name || existing.docs[0].data().name || normalizedId,
+                            department: requestItem.department || existing.docs[0].data().department || "",
+                            team: requestItem.team || existing.docs[0].data().team || requestItem.department || "",
+                            position: requestItem.position || existing.docs[0].data().position || ""
+                        });
+                    }
+
+                    await setDoc(doc(db, "approved_users", authUid), {
+                        userId: normalizedId,
+                        role: "user",
+                        name: requestItem.name || normalizedId,
+                        approvedAt: new Date().toISOString(),
+                        approvedBy: currentUser?.id || "master",
+                        status: "approved"
+                    }, { merge: true });
+
+                    await updateDoc(doc(db, "signup_requests", requestItem.id), {
+                        status: "approved",
+                        reviewedAt: new Date().toISOString(),
+                        reviewedBy: currentUser?.id || "master",
+                        rejectReason: ""
+                    });
+
+                    await logAction("create", "users", normalizedId, `[사용자] 가입신청 승인: ${requestItem.name || normalizedId}(${normalizedId})`);
+                    showToast("가입 신청을 승인했습니다.");
+                } catch (e) {
+                    console.error("[approveSignUpRequest]", e);
+                    showToast("가입 신청 승인 중 오류가 발생했습니다.");
+                }
+            };
+
+            const rejectSignUpRequest = async (requestId, reason = "") => {
+                if (isGuest || !isMaster) { denyMasterAction(); return; }
+                if (!requestId) return;
+                try {
+                    await updateDoc(doc(db, "signup_requests", requestId), {
+                        status: "rejected",
+                        reviewedAt: new Date().toISOString(),
+                        reviewedBy: currentUser?.id || "master",
+                        rejectReason: String(reason || "").trim()
+                    });
+                    showToast("가입 신청을 반려했습니다.");
+                } catch (e) {
+                    console.error("[rejectSignUpRequest]", e);
+                    showToast("가입 신청 반려 중 오류가 발생했습니다.");
+                }
+            };
+
+            const setMemberActiveStatus = async (memberId, active) => {
+                if (isGuest || !isMaster) { denyMasterAction(); return; }
+                const member = (data.members || []).find((entry) => entry.id === memberId);
+                if (!member) {
+                    showToast("사용자 정보를 찾을 수 없습니다.");
+                    return;
+                }
+                try {
+                    const now = nowIso();
+                    await updateDoc(doc(db, "members", memberId), {
+                        isActive: active,
+                        disabledAt: active ? deleteField() : now,
+                        disabledBy: active ? deleteField() : (currentUser?.id || "master"),
+                        updatedAt: now,
+                        updatedBy: currentUser?.id || "master",
+                        lastEditedAt: now,
+                        lastEditedBy: currentUser?.id || "master"
+                    });
+                    if (member.authUid) {
+                        await setDoc(doc(db, "approved_users", member.authUid), {
+                            status: active ? "approved" : "disabled",
+                            updatedAt: now,
+                            updatedBy: currentUser?.id || "master"
+                        }, { merge: true });
+                    }
+                    await logAction('update', 'users', memberId, `[사용자] ${member.name} 계정 ${active ? '활성화' : '비활성화'}`, {
+                        changedFields: ['isActive', 'status'],
+                        before: summarizeForAudit(member),
+                        after: summarizeForAudit({ ...member, isActive: active, status: active ? 'approved' : 'disabled' })
+                    });
+                    showToast(`계정이 ${active ? '활성화' : '비활성화'}되었습니다.`);
+                } catch (e) {
+                    console.error("[setMemberActiveStatus]", e);
+                    showToast("계정 상태 변경 중 오류가 발생했습니다.");
+                }
+            };
+
+            const transferOwnership = async (fromMemberId, toMemberId, disableSourceAfter = false) => {
+                if (isGuest || !isMaster) { denyMasterAction(); return { ok: false }; }
+                const fromMember = (data.members || []).find((entry) => entry.id === fromMemberId);
+                const toMember = (data.members || []).find((entry) => entry.id === toMemberId);
+                if (!fromMember || !toMember || fromMemberId === toMemberId) {
+                    showToast("이관 대상 사용자를 확인해 주세요.");
+                    return { ok: false };
+                }
+                const fromOwnerId = String(fromMember.userId || "").trim().toLowerCase();
+                const toOwnerId = String(toMember.userId || "").trim().toLowerCase();
+                const toTeam = String(toMember.team || toMember.department || "").trim();
+                let movedCount = 0;
+
+                try {
+                    const touchNow = nowIso();
+                    const candidateCols = ["customers", "deals", "issues", "projects"];
+                    for (const col of candidateCols) {
+                        const activeRows = data[col] || [];
+                        for (const row of activeRows) {
+                            const next = {};
+                            let touched = false;
+                            if (String(row.ownerId || "").trim().toLowerCase() === fromOwnerId && toOwnerId) {
+                                next.ownerId = toOwnerId;
+                                touched = true;
+                            }
+                            if ((col === "deals" || col === "projects") && String(row.assigneeId || "") === fromMemberId) {
+                                next.assigneeId = toMemberId;
+                                touched = true;
+                            }
+                            if (touched) {
+                                next.teamId = toTeam || row.teamId || "";
+                                next.updatedAt = touchNow;
+                                next.updatedBy = currentUser?.id || "master";
+                                next.lastEditedAt = touchNow;
+                                next.lastEditedBy = currentUser?.id || "master";
+                                await updateDoc(doc(db, col, row.id), next);
+                                movedCount += 1;
+                            }
+                        }
+                    }
+
+                    const ownerTargets = { ...(data.settings?.ownerTargets || {}) };
+                    Object.keys(ownerTargets).forEach((yearKey) => {
+                        const yearTargets = { ...(ownerTargets[yearKey] || {}) };
+                        const fromValue = Number(yearTargets[fromMemberId] || 0);
+                        if (fromValue > 0) {
+                            yearTargets[toMemberId] = Number(yearTargets[toMemberId] || 0) + fromValue;
+                            delete yearTargets[fromMemberId];
+                            ownerTargets[yearKey] = yearTargets;
+                        }
+                    });
+                    await setDoc(doc(db, "config", "settings"), { ownerTargets }, { merge: true });
+
+                    await logAction('transfer', 'ownership', fromMemberId, `[소유권 이관] ${fromMember.name} -> ${toMember.name} (${movedCount}건)`, {
+                        changedFields: ['ownerId', 'assigneeId', 'teamId'],
+                        before: { fromMemberId, fromOwnerId },
+                        after: { toMemberId, toOwnerId, movedCount }
+                    });
+
+                    if (disableSourceAfter) {
+                        await setMemberActiveStatus(fromMemberId, false);
+                    }
+                    showToast(`소유권 이관 완료 (${movedCount}건)`);
+                    return { ok: true, movedCount };
+                } catch (e) {
+                    console.error("[transferOwnership]", e);
+                    showToast("소유권 이관 중 오류가 발생했습니다.");
+                    return { ok: false };
                 }
             };
 
             const resetAllData = async () => {
-                if(isGuest) return;
+                if(isGuest || !isMaster) { denyMasterAction(); return; }
                 if(!window.confirm("경고: 모든 데이터를 영구적으로 삭제합니다.")) return;
                 if(!window.confirm("정말 실행하시겠습니까?")) return;
                 const finalToken = window.prompt("최종 확인을 위해 'RESET ALL'을 정확히 입력하세요.");
@@ -553,11 +1272,17 @@
                     return;
                 }
                 
-                const collections = ["customers", "members", "deals", "issues", "projects", "logs"];
+                const collections = ["customers", "members", "deals", "issues", "projects", "logs", "signup_requests"];
                 try {
-                    const totalCount = collections.reduce((sum, col) => sum + (data[col]?.length || 0), 0);
+                    const totalCount = collections.reduce((sum, col) => {
+                        const activeCount = data[col]?.length || 0;
+                        const deletedCount = data.deleted?.[col]?.length || 0;
+                        return sum + activeCount + deletedCount;
+                    }, 0);
                     for (const col of collections) {
-                        for (const item of data[col]) {
+                        const mergedItems = [...(data[col] || []), ...(data.deleted?.[col] || [])];
+                        const uniqueItems = Array.from(new Map(mergedItems.map((item) => [item.id, item])).values());
+                        for (const item of uniqueItems) {
                             await deleteDoc(doc(db, col, item.id));
                         }
                     }
@@ -567,8 +1292,87 @@
             };
 
             const resetYearData = async (targetYear) => {
-                if(isGuest) return;
-                await logAction('delete', 'year_data', targetYear, `[시스템] ${targetYear}년도 데이터 일괄 삭제`);
+                if(isGuest || !isMaster) { denyMasterAction(); return; }
+                const year = String(targetYear || '').trim();
+                if (!/^\d{4}$/.test(year)) {
+                    showToast("삭제할 연도(YYYY)를 정확히 입력해 주세요.");
+                    return;
+                }
+                if (!window.confirm(`${year}년도 데이터를 삭제합니다. 계속할까요?`)) return;
+
+                const startsWithYear = (value) => typeof value === 'string' && value.startsWith(year);
+                const targets = [];
+
+                (data.deals || []).forEach((item) => {
+                    if ([item.startDate, item.targetDate, item.lastUpdateDate].some(startsWithYear)) {
+                        targets.push({ col: "deals", id: item.id });
+                    }
+                });
+                (data.projects || []).forEach((item) => {
+                    if ([item.startDate, item.dueDate].some(startsWithYear)) {
+                        targets.push({ col: "projects", id: item.id });
+                    }
+                });
+                (data.issues || []).forEach((item) => {
+                    if ([item.date].some(startsWithYear)) {
+                        targets.push({ col: "issues", id: item.id });
+                    }
+                });
+                (data.snapshots || []).forEach((item) => {
+                    if (startsWithYear(item.yearMonth)) {
+                        targets.push({ col: "snapshots", id: item.id });
+                    }
+                });
+                (data.logs || []).forEach((item) => {
+                    if (startsWithYear(item.timestamp)) {
+                        targets.push({ col: "logs", id: item.id });
+                    }
+                });
+                (data.signupRequests || []).forEach((item) => {
+                    if ([item.requestedAt, item.reviewedAt].some(startsWithYear)) {
+                        targets.push({ col: "signup_requests", id: item.id });
+                    }
+                });
+
+                const deduped = Array.from(new Map(targets.map((t) => [`${t.col}:${t.id}`, t])).values());
+                const hasSettingYear = Boolean(data.settings?.targets?.[year] || data.settings?.ownerTargets?.[year]);
+
+                if (!deduped.length && !hasSettingYear) {
+                    showToast(`${year}년도 삭제 대상 데이터가 없습니다.`);
+                    return;
+                }
+
+                try {
+                    const chunkSize = 400;
+                    for (let i = 0; i < deduped.length; i += chunkSize) {
+                        const batch = writeBatch(db);
+                        deduped.slice(i, i + chunkSize).forEach(({ col, id }) => {
+                            batch.delete(doc(db, col, id));
+                        });
+                        await batch.commit();
+                    }
+
+                    const nextTargets = { ...(data.settings?.targets || {}) };
+                    delete nextTargets[year];
+                    const nextOwnerTargets = { ...(data.settings?.ownerTargets || {}) };
+                    delete nextOwnerTargets[year];
+
+                    await setDoc(
+                        doc(db, "config", "settings"),
+                        {
+                            ...(data.settings || {}),
+                            targets: nextTargets,
+                            ownerTargets: nextOwnerTargets
+                        },
+                        { merge: true }
+                    );
+
+                    await logAction('delete', 'year_data', year, `[시스템] ${year}년도 데이터 ${deduped.length}건 삭제`);
+                    showToast(`${year}년도 데이터 삭제 완료 (${deduped.length}건).`);
+                } catch (e) {
+                    console.error("[resetYearData]", e);
+                    showToast("연도 데이터 삭제 중 오류가 발생했습니다.");
+                }
             };
 
             const createMonthlySnapshot = async (yearMonth, metrics) => {
@@ -596,7 +1400,9 @@
                 addIssue: crud('issues').add, updateIssue: crud('issues').update, deleteIssue: crud('issues').delete,
                 addMember: crud('members').add, updateMember: crud('members').update, deleteMember: crud('members').delete,
                 addProject: crud('projects').add, updateProject: crud('projects').update, deleteProject: crud('projects').delete, updateProjectStatus,
-                updateSettings, resetAllData, resetYearData, masterCreateUser, updateMemberPassword, backupAllData, createMonthlySnapshot
+                updateSettings, resetAllData, resetYearData, masterCreateUser, updateMemberPassword, changeMyPassword, backupAllData, createMonthlySnapshot,
+                restoreSoftDeletedItem, acquireEditLock, releaseEditLock, transferOwnership, setMemberActiveStatus,
+                signUpRequest, approveSignUpRequest, rejectSignUpRequest
             };
         };
 
@@ -621,12 +1427,30 @@
             );
         };
 
-        const AuthPage = ({ onLogin, onGuest }) => {
+        const AuthPage = ({ onLogin, onRequestSignup, signupOptions }) => {
             const [id, setId] = useState('');
             const [password, setPassword] = useState('');
             const [rememberMe, setRememberMe] = useState(false);
             const [error, setError] = useState('');
             const [loading, setLoading] = useState(false);
+            const [showSignup, setShowSignup] = useState(false);
+            const [signupLoading, setSignupLoading] = useState(false);
+            const [signupMessage, setSignupMessage] = useState('');
+            const [signupForm, setSignupForm] = useState({
+                name: '',
+                id: '',
+                password: '',
+                department: '',
+                team: '',
+                position: ''
+            });
+            const deptOptions = (signupOptions?.departments && signupOptions.departments.length)
+                ? signupOptions.departments
+                : (INITIAL_DATA.settings.departments || []);
+            const teamOptions = deptOptions;
+            const positionOptions = (signupOptions?.positions && signupOptions.positions.length)
+                ? signupOptions.positions
+                : (INITIAL_DATA.settings.positions || []);
 
             useEffect(() => {
                 const savedId = localStorage.getItem('m_crm_saved_id');
@@ -636,44 +1460,72 @@
                 }
             }, []);
 
+            useEffect(() => {
+                setSignupForm((prev) => ({
+                    ...prev,
+                    department: prev.department || deptOptions[0] || '',
+                    team: prev.team || teamOptions[0] || deptOptions[0] || '',
+                    position: prev.position || positionOptions[0] || ''
+                }));
+            }, [signupOptions]);
+
             const handleSubmit = async (e) => {
                 e.preventDefault();
                 setError('');
                 setLoading(true);
                 
                 try {
-                    let userToLogin = null;
-                    if (id === 'master') {
-                        const ok = await verifyMasterPassword(password);
-                        if (!ok) throw new Error("비밀번호가 일치하지 않습니다.");
-                        userToLogin = { id: 'master', name: '최고관리자', role: 'admin' };
-                    } else {
-                        const q = query(collection(db, "members"), where("userId", "==", id));
-                        const querySnapshot = await getDocs(q);
-                        
-                        if (querySnapshot.empty) throw new Error("존재하지 않는 아이디입니다.");
-
-                        let foundUser = null;
-                        querySnapshot.forEach((doc) => {
-                            const userData = doc.data();
-                            if (userData.password === password) foundUser = { id: userData.userId, name: userData.name, role: 'user' };
-                        });
-
-                        if (foundUser) userToLogin = foundUser;
-                        else throw new Error("비밀번호가 일치하지 않습니다.");
+                    const normalizedId = String(id || '').trim().toLowerCase();
+                    if (!normalizedId) throw new Error("아이디를 입력해 주세요.");
+                    const email = getEmailFromId(normalizedId);
+                    const credential = await signInWithEmailAndPassword(auth, email, password);
+                    const approvedUser = await resolveApprovedUser(credential.user);
+                    if (!approvedUser) {
+                        await signOut(auth);
+                        throw new Error("관리자 승인 대기 중입니다. 승인 후 로그인해 주세요.");
                     }
 
-                    if (userToLogin) {
-                        if (rememberMe) {
-                            localStorage.setItem('m_crm_saved_id', id);
-                        } else {
-                            localStorage.removeItem('m_crm_saved_id');
-                        }
-                        onLogin(userToLogin);
-                    }
+                    if (rememberMe) localStorage.setItem('m_crm_saved_id', normalizedId);
+                    else localStorage.removeItem('m_crm_saved_id');
+
+                    onLogin(approvedUser);
                 } catch (err) {
-                    setError(err.message);
+                    const msg = String(err?.message || "");
+                    if (msg.includes("auth/user-not-found") || msg.includes("auth/invalid-credential")) setError("아이디 또는 비밀번호가 올바르지 않습니다.");
+                    else if (msg.includes("auth/wrong-password")) setError("아이디 또는 비밀번호가 올바르지 않습니다.");
+                    else if (msg.includes("auth/too-many-requests")) setError("요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.");
+                    else setError(err.message || "로그인 중 오류가 발생했습니다.");
                     setLoading(false);
+                }
+            };
+
+            const handleSignupSubmit = async (e) => {
+                e.preventDefault();
+                setSignupMessage('');
+                setSignupLoading(true);
+                try {
+                    if (typeof onRequestSignup !== 'function') {
+                        setSignupMessage("가입 신청 기능이 아직 활성화되지 않았습니다.");
+                        return;
+                    }
+
+                    const result = await onRequestSignup({
+                        name: signupForm.name,
+                        id: signupForm.id,
+                        password: signupForm.password,
+                        department: signupForm.department,
+                        team: signupForm.team,
+                        position: signupForm.position
+                    });
+
+                    if (result?.ok) {
+                        setSignupMessage("신청 완료: 관리자 승인 후 로그인할 수 있습니다.");
+                        setSignupForm((prev) => ({ ...prev, name: '', id: '', password: '' }));
+                    } else {
+                        setSignupMessage(result?.message || "가입 신청에 실패했습니다.");
+                    }
+                } finally {
+                    setSignupLoading(false);
                 }
             };
 
@@ -706,10 +1558,56 @@
                                 {loading ? '인증 중...' : '로그인'}
                             </button>
                         </form>
-                        <div className="mt-4 pt-4 border-t border-slate-100 text-center">
-                            <button onClick={onGuest} className="text-sm text-slate-500 hover:text-slate-800 font-medium underline decoration-slate-300 hover:decoration-slate-800">
-                                비회원(보기 전용)으로 둘러보기
+                        <div className="mt-4 pt-4 border-t border-slate-100">
+                            <button
+                                type="button"
+                                onClick={() => setShowSignup((v) => !v)}
+                                className="w-full text-sm text-slate-600 font-semibold hover:text-slate-900 underline decoration-slate-300"
+                            >
+                                {showSignup ? "회원가입 신청 닫기" : "회원가입 신청"}
                             </button>
+                            {showSignup && (
+                                <form onSubmit={handleSignupSubmit} className="mt-4 space-y-3 bg-slate-50 border border-slate-200 rounded-lg p-4">
+                                    <div>
+                                        <label className="block text-xs text-slate-500 mb-1 font-medium">이름 *</label>
+                                        <input type="text" required value={signupForm.name} onChange={(e) => setSignupForm((prev) => ({ ...prev, name: e.target.value }))} className="w-full bg-white border border-slate-200 rounded p-2.5 outline-none focus:border-brand-primary transition-colors" placeholder="홍길동" />
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <div>
+                                            <label className="block text-xs text-slate-500 mb-1 font-medium">아이디 *</label>
+                                            <input type="text" required value={signupForm.id} onChange={(e) => setSignupForm((prev) => ({ ...prev, id: e.target.value }))} className="w-full bg-white border border-slate-200 rounded p-2.5 outline-none focus:border-brand-primary transition-colors" placeholder="user_id" />
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs text-slate-500 mb-1 font-medium">비밀번호 *</label>
+                                            <input type="password" required minLength="6" value={signupForm.password} onChange={(e) => setSignupForm((prev) => ({ ...prev, password: e.target.value }))} className="w-full bg-white border border-slate-200 rounded p-2.5 outline-none focus:border-brand-primary transition-colors" placeholder="최소 6자" />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-3 gap-2">
+                                        <div>
+                                            <label className="block text-xs text-slate-500 mb-1 font-medium">부서 *</label>
+                                            <select required value={signupForm.department} onChange={(e) => setSignupForm((prev) => ({ ...prev, department: e.target.value }))} className="w-full bg-white border border-slate-200 rounded p-2.5 outline-none focus:border-brand-primary transition-colors">
+                                                {deptOptions.map((dept) => <option key={dept} value={dept}>{dept}</option>)}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs text-slate-500 mb-1 font-medium">팀 *</label>
+                                            <select required value={signupForm.team} onChange={(e) => setSignupForm((prev) => ({ ...prev, team: e.target.value }))} className="w-full bg-white border border-slate-200 rounded p-2.5 outline-none focus:border-brand-primary transition-colors">
+                                                {teamOptions.map((team) => <option key={team} value={team}>{team}</option>)}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs text-slate-500 mb-1 font-medium">직급 *</label>
+                                            <select required value={signupForm.position} onChange={(e) => setSignupForm((prev) => ({ ...prev, position: e.target.value }))} className="w-full bg-white border border-slate-200 rounded p-2.5 outline-none focus:border-brand-primary transition-colors">
+                                                {positionOptions.map((position) => <option key={position} value={position}>{position}</option>)}
+                                            </select>
+                                        </div>
+                                    </div>
+                                    {signupMessage && <div className="text-xs font-bold bg-white border border-slate-200 rounded p-2 text-slate-600">{signupMessage}</div>}
+                                    <button type="submit" disabled={signupLoading} className="w-full bg-slate-800 text-white py-2.5 rounded-lg font-bold hover:bg-slate-700 transition-colors disabled:opacity-50">
+                                        {signupLoading ? "신청 중..." : "관리자 승인 요청 보내기"}
+                                    </button>
+                                </form>
+                            )}
                         </div>
                     </div>
                 </div>
@@ -790,10 +1688,11 @@
         };
         
         const MemberForm = ({ initialData, settings, onSubmit, onCancel }) => {
-            const [form, setForm] = useState(initialData || { name: '', department: '', position: '', color: 'bg-slate-500' });
+            const [form, setForm] = useState(initialData || { name: '', department: '', team: '', position: '', color: 'bg-slate-500', isActive: true });
             return (
                 <form onSubmit={(e) => { e.preventDefault(); onSubmit(form); }} className="space-y-4">
                     <div><label className="block text-xs text-slate-500 mb-1 font-medium">부서 (Department) *</label><input list="deptList" required value={form.department} onChange={e => setForm({...form, department: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded p-2.5 outline-none focus:border-brand-primary transition-colors" /><datalist id="deptList">{settings.departments.map(d => <option key={d} value={d} />)}</datalist></div>
+                    <div><label className="block text-xs text-slate-500 mb-1 font-medium">팀 (Team) *</label><input list="teamList" required value={form.team || ''} onChange={e => setForm({...form, team: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded p-2.5 outline-none focus:border-brand-primary transition-colors" /><datalist id="teamList">{(settings.departments || []).map(t => <option key={t} value={t} />)}</datalist></div>
                     <Input label="이름 *" required value={form.name} onChange={e => setForm({...form, name: e.target.value})} />
                     <Input label="직급 (Position) *" required value={form.position} onChange={e => setForm({...form, position: e.target.value})} />
                     <div>
@@ -809,41 +1708,125 @@
             );
         };
 
-        const SettingsView = ({ settings, data, onUpdateSettings, onResetAll, onResetYear, onMasterCreateUser, onUpdateMemberPassword, onDeleteMember, onBackupData, isMaster, isGuest }) => {
+        const SettingsView = ({ settings, data, onUpdateSettings, onResetAll, onResetYear, onMasterCreateUser, onUpdateMemberPassword, onChangeMyPassword, onDeleteMember, onSetMemberActive, onTransferOwnership, onRestoreDeletedItem, onBackupData, onApproveSignUp, onRejectSignUp, isMaster, isGuest }) => {
             const [local, setLocal] = useState(settings);
+            const SETTINGS_DRAFT_KEY = 'm_crm_settings_draft_v1';
             const [newYear, setNewYear] = useState(''); const [newTarget, setNewTarget] = useState(''); 
-            const [newProduct, setNewProduct] = useState(''); const [newDept, setNewDept] = useState('');
+            const [newProduct, setNewProduct] = useState(''); const [newDept, setNewDept] = useState(''); const [newPosition, setNewPosition] = useState('');
             const [ownerTargetYear, setOwnerTargetYear] = useState(new Date().getFullYear().toString());
             const [resetTargetYear, setResetTargetYear] = useState(new Date().getFullYear().toString());
             const [isUnlocked, setIsUnlocked] = useState(false);
             const [password, setPassword] = useState('');
             const [error, setError] = useState('');
+            const [verifying, setVerifying] = useState(false);
+            const [settingsDirty, setSettingsDirty] = useState(false);
             
             const [newUserId, setNewUserId] = useState('');
             const [newUserPass, setNewUserPass] = useState('');
             const [newUserName, setNewUserName] = useState('');
             const [newUserDept, setNewUserDept] = useState('');
+            const [newUserTeam, setNewUserTeam] = useState('');
             const [newUserPos, setNewUserPos] = useState('');
             const [creatingUser, setCreatingUser] = useState(false);
+            const [myCurrentPassword, setMyCurrentPassword] = useState('');
+            const [myNextPassword, setMyNextPassword] = useState('');
+            const [myNextPasswordConfirm, setMyNextPasswordConfirm] = useState('');
+            const [myPwLoading, setMyPwLoading] = useState(false);
+            const [myPwMessage, setMyPwMessage] = useState('');
 
             const [logSearchQuery, setLogSearchQuery] = useState('');
             const [logPage, setLogPage] = useState(1);
             const logsPerPage = 10;
 
-            useEffect(() => {
-                setLocal(settings);
-            }, [settings]);
+            const updateLocal = (updater) => {
+                setLocal((prev) => {
+                    const next = typeof updater === 'function' ? updater(prev) : updater;
+                    try { localStorage.setItem(SETTINGS_DRAFT_KEY, JSON.stringify(next)); } catch (_) {}
+                    return next;
+                });
+                setSettingsDirty(true);
+            };
 
-            const handleSave = () => !isGuest && onUpdateSettings(local);
-            const addTarget = () => { if(newYear && newTarget) { setLocal(p => ({...p, targets: {...p.targets, [newYear]: parseInt(newTarget)}})); setNewYear(''); setNewTarget(''); }};
-            const removeTarget = (y) => { const t = {...local.targets}; delete t[y]; setLocal(p => ({...p, targets: t})); };
-            const addProduct = () => { if(newProduct && !local.products.includes(newProduct)) { setLocal(p => ({...p, products: [...p.products, newProduct]})); setNewProduct(''); }};
-            const removeProduct = (prod) => { setLocal(p => ({...p, products: p.products.filter(p => p !== prod)})); };
-            const addDept = () => { if(newDept && !local.departments.includes(newDept)) { setLocal(p => ({...p, departments: [...p.departments, newDept]})); setNewDept(''); }};
-            const removeDept = (dept) => { setLocal(p => ({...p, departments: p.departments.filter(d => d !== dept)})); };
+            useEffect(() => {
+                if (settingsDirty) return;
+                const normalizeDepartments = (base, extra) => Array.from(new Set([
+                    ...((Array.isArray(base) ? base : [])),
+                    ...((Array.isArray(extra) ? extra : []))
+                ].map((v) => String(v || '').trim()).filter(Boolean)));
+                try {
+                    const draftRaw = localStorage.getItem(SETTINGS_DRAFT_KEY);
+                    if (draftRaw) {
+                        const draft = JSON.parse(draftRaw);
+                        if (draft && typeof draft === 'object') {
+                            const mergedDepartments = normalizeDepartments(
+                                draft.departments || settings.departments,
+                                draft.teams || settings.teams
+                            );
+                            setLocal({
+                                ...settings,
+                                ...draft,
+                                departments: mergedDepartments,
+                                teams: mergedDepartments,
+                                ownerTargets: draft.ownerTargets || settings.ownerTargets || {}
+                            });
+                            setSettingsDirty(true);
+                            return;
+                        }
+                    }
+                } catch (_) {}
+                const mergedDepartments = normalizeDepartments(settings.departments, settings.teams);
+                setLocal({ ...settings, departments: mergedDepartments, teams: mergedDepartments });
+            }, [settings, settingsDirty]);
+
+            const handleSave = async () => {
+                if (isGuest || !isMaster) return;
+                const ok = await onUpdateSettings(local);
+                if (ok) {
+                    setSettingsDirty(false);
+                    try { localStorage.removeItem(SETTINGS_DRAFT_KEY); } catch (_) {}
+                }
+            };
+            const addTarget = () => {
+                if (newYear && newTarget) {
+                    updateLocal((p) => ({ ...p, targets: { ...p.targets, [newYear]: parseInt(newTarget) } }));
+                    setNewYear('');
+                    setNewTarget('');
+                }
+            };
+            const removeTarget = (y) => {
+                updateLocal((p) => {
+                    const t = { ...(p.targets || {}) };
+                    delete t[y];
+                    return { ...p, targets: t };
+                });
+            };
+            const addProduct = () => {
+                const normalized = String(newProduct || '').trim();
+                if (normalized && !(local.products || []).includes(normalized)) {
+                    updateLocal((p) => ({ ...p, products: [...(p.products || []), normalized] }));
+                    setNewProduct('');
+                }
+            };
+            const removeProduct = (prod) => { updateLocal((p) => ({ ...p, products: (p.products || []).filter((item) => item !== prod) })); };
+            const addDept = () => {
+                const normalized = String(newDept || '').trim();
+                if (normalized && !(local.departments || []).includes(normalized)) {
+                    updateLocal((p) => ({ ...p, departments: [...(p.departments || []), normalized] }));
+                    setNewDept('');
+                }
+            };
+            const removeDept = (dept) => { updateLocal((p) => ({ ...p, departments: (p.departments || []).filter((item) => item !== dept) })); };
+            const addPosition = () => {
+                const normalized = String(newPosition || '').trim();
+                if (normalized && !(local.positions || []).includes(normalized)) {
+                    updateLocal((p) => ({ ...p, positions: [...(p.positions || []), normalized] }));
+                    setNewPosition('');
+                }
+            };
+            const removePosition = (position) => { updateLocal((p) => ({ ...p, positions: (p.positions || []).filter((pos) => pos !== position) })); };
             const setOwnerTarget = (memberId, value) => {
                 const amount = parseInt(String(value || "0").replace(/[^0-9]/g, '')) || 0;
-                setLocal(prev => ({
+                updateLocal(prev => ({
                     ...prev,
                     ownerTargets: {
                         ...(prev.ownerTargets || {}),
@@ -855,23 +1838,62 @@
                 }));
             };
 
-            const verifyPassword = () => {
-                if(password === '0908') { setIsUnlocked(true); setError(''); } 
-                else { setError('비밀번호가 일치하지 않습니다.'); }
+            const verifyPassword = async () => {
+                setVerifying(true);
+                try {
+                    const ok = await verifyMasterPassword(password);
+                    if(ok) { setIsUnlocked(true); setError(''); } 
+                    else { setError('비밀번호가 일치하지 않습니다.'); }
+                } catch (_) {
+                    setError('관리자 인증 중 오류가 발생했습니다.');
+                } finally {
+                    setVerifying(false);
+                }
             };
 
             const handleCreateUser = async (e) => {
                 e.preventDefault();
                 setCreatingUser(true);
-                await onMasterCreateUser(newUserId, newUserPass, newUserName, newUserDept, newUserPos);
+                await onMasterCreateUser(newUserId, newUserPass, newUserName, newUserDept, (newUserTeam || newUserDept), newUserPos);
                 setCreatingUser(false);
-                setNewUserId(''); setNewUserPass(''); setNewUserName('');
+                setNewUserId(''); setNewUserPass(''); setNewUserName(''); setNewUserDept(''); setNewUserTeam(''); setNewUserPos('');
             };
 
             const handleChangePassword = (member) => {
-                const newPw = prompt(`[${member.name}] 님의 새로운 비밀번호를 입력하세요.`);
-                if (newPw) {
-                    onUpdateMemberPassword(member.id, newPw);
+                onUpdateMemberPassword(member.id, "");
+            };
+
+            const handleMyPasswordChange = async (e) => {
+                e.preventDefault();
+                setMyPwMessage('');
+                const currentPlain = String(myCurrentPassword || '');
+                const nextPlain = String(myNextPassword || '');
+                const nextConfirm = String(myNextPasswordConfirm || '');
+                if (!currentPlain || !nextPlain || !nextConfirm) {
+                    setMyPwMessage("모든 항목을 입력해 주세요.");
+                    return;
+                }
+                if (nextPlain !== nextConfirm) {
+                    setMyPwMessage("새 비밀번호 확인이 일치하지 않습니다.");
+                    return;
+                }
+                if (nextPlain.length < 6) {
+                    setMyPwMessage("새 비밀번호는 6자 이상이어야 합니다.");
+                    return;
+                }
+                setMyPwLoading(true);
+                try {
+                    const result = await onChangeMyPassword?.(currentPlain, nextPlain);
+                    if (result?.ok) {
+                        setMyCurrentPassword('');
+                        setMyNextPassword('');
+                        setMyNextPasswordConfirm('');
+                        setMyPwMessage("비밀번호가 변경되었습니다.");
+                    } else {
+                        setMyPwMessage(result?.message || "비밀번호 변경에 실패했습니다.");
+                    }
+                } finally {
+                    setMyPwLoading(false);
                 }
             };
 
@@ -879,6 +1901,43 @@
                 if (confirm(`정말 [${member.name}] 님의 계정을 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.`)) {
                     onDeleteMember(member.id);
                 }
+            };
+
+            const handleDisableAccount = async (member) => {
+                if (!confirm(`[${member.name}] 계정을 비활성화할까요?`)) return;
+                await onSetMemberActive?.(member.id, false);
+            };
+
+            const handleEnableAccount = async (member) => {
+                await onSetMemberActive?.(member.id, true);
+            };
+
+            const handleTransferOwnership = async (member) => {
+                const candidates = (data.members || []).filter((entry) => entry.id !== member.id && entry.isActive !== false);
+                if (!candidates.length) {
+                    alert("이관 받을 활성 사용자 계정이 없습니다.");
+                    return;
+                }
+                const guide = candidates.map((entry) => `${entry.userId || entry.name}`).join(", ");
+                const inputUserId = prompt(`[${member.name}] 소유권을 이관할 대상 userId를 입력하세요.\n가능 대상: ${guide}`);
+                if (!inputUserId) return;
+                const target = candidates.find((entry) => String(entry.userId || "").toLowerCase() === String(inputUserId).toLowerCase());
+                if (!target) {
+                    alert("대상 userId를 찾지 못했습니다.");
+                    return;
+                }
+                const disableAfter = confirm("이관 후 원 사용자 계정을 비활성화할까요?");
+                await onTransferOwnership?.(member.id, target.id, disableAfter);
+            };
+
+            const deletedCollections = ["customers", "deals", "issues", "projects", "members"];
+            const deletedCount = deletedCollections.reduce((sum, col) => sum + ((data.deleted?.[col] || []).length), 0);
+            const deletedColLabel = {
+                customers: "고객사",
+                deals: "계약",
+                issues: "이슈",
+                projects: "프로젝트",
+                members: "담당자"
             };
 
             const filteredLogs = useMemo(() => {
@@ -900,10 +1959,39 @@
             const indexOfFirstLog = indexOfLastLog - logsPerPage;
             const currentLogs = filteredLogs.slice(indexOfFirstLog, indexOfLastLog);
             const totalPages = Math.ceil(filteredLogs.length / logsPerPage);
+            const pendingRequests = (data.signupRequests || []).filter((r) => (r.status || "pending") === "pending");
+
+            const handleApproveSignup = async (requestItem) => {
+                await onApproveSignUp?.(requestItem);
+            };
+
+            const handleRejectSignup = async (requestItem) => {
+                const reason = prompt(`[${requestItem?.userId || "-"}] 신청 반려 사유를 입력하세요. (선택)`) || "";
+                await onRejectSignUp?.(requestItem?.id, reason);
+            };
 
             return (
                 <div className="space-y-6 animate-slide-up">
-                    <div className="flex justify-between items-center mb-6"><h2 className="text-2xl font-bold text-slate-800">환경 설정 (Settings)</h2>{!isGuest && <button onClick={handleSave} className="bg-brand-primary text-white px-6 py-2 rounded-lg font-bold hover:bg-blue-600 shadow-lg shadow-blue-500/20">설정 저장하기</button>}</div>
+                    <div className="flex justify-between items-center mb-6">
+                        <div className="flex items-center gap-3">
+                            <h2 className="text-2xl font-bold text-slate-800">환경 설정 (Settings)</h2>
+                            {settingsDirty && <span className="text-xs font-bold text-amber-600 bg-amber-50 border border-amber-100 rounded px-2 py-1">저장되지 않은 변경사항</span>}
+                        </div>
+                        {!isGuest && isMaster && <button onClick={handleSave} className="bg-brand-primary text-white px-6 py-2 rounded-lg font-bold hover:bg-blue-600 shadow-lg shadow-blue-500/20">설정 저장하기</button>}
+                    </div>
+                    <div className="glass-panel p-6 rounded-xl border-slate-200">
+                        <h3 className="text-lg font-bold text-slate-800 mb-4 border-b border-slate-100 pb-2">내 비밀번호 변경</h3>
+                        <form onSubmit={handleMyPasswordChange} className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
+                            <Input label="현재 비밀번호" type="password" value={myCurrentPassword} onChange={e=>setMyCurrentPassword(e.target.value)} />
+                            <Input label="새 비밀번호" type="password" value={myNextPassword} onChange={e=>setMyNextPassword(e.target.value)} />
+                            <Input label="새 비밀번호 확인" type="password" value={myNextPasswordConfirm} onChange={e=>setMyNextPasswordConfirm(e.target.value)} />
+                            <button type="submit" disabled={myPwLoading} className="h-[42px] bg-slate-800 text-white rounded-lg font-bold hover:bg-slate-700 disabled:opacity-50">
+                                {myPwLoading ? "변경 중..." : "비밀번호 변경"}
+                            </button>
+                        </form>
+                        <p className="text-xs text-slate-500 mt-2">보안을 위해 현재 비밀번호 재인증 후 변경됩니다.</p>
+                        {myPwMessage && <p className="text-xs font-bold mt-2 text-slate-700">{myPwMessage}</p>}
+                    </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div className="glass-panel p-6 rounded-xl hover:border-slate-300 transition-colors">
                             <h3 className="text-lg font-bold text-slate-800 mb-4 border-b border-slate-100 pb-2">연도별 목표 매출액</h3>
@@ -940,6 +2028,11 @@
                             <h3 className="text-lg font-bold text-slate-800 mb-4 border-b border-slate-100 pb-2">부서 관리</h3>
                             <div className="flex gap-2 mb-4"><input type="text" placeholder="부서명 입력" value={newDept} onChange={e=>setNewDept(e.target.value)} disabled={isGuest} className="bg-white text-slate-800 p-2.5 rounded border border-slate-200 outline-none focus:border-brand-primary transition-colors flex-1"/><button onClick={addDept} disabled={isGuest} className="bg-slate-200 text-slate-600 px-3 rounded hover:bg-slate-300 disabled:opacity-50"><Icons.Plus/></button></div>
                             <div className="flex flex-wrap gap-2">{local.departments.map(d=><span key={d} className="bg-blue-50 text-blue-600 border border-blue-100 px-3 py-1 rounded-full text-sm flex items-center gap-2 hover:bg-blue-100 transition-colors">{d}{!isGuest && <button onClick={()=>removeDept(d)} className="hover:text-blue-800"><Icons.X/></button>}</span>)}</div>
+                        </div>
+                        <div className="glass-panel p-6 rounded-xl hover:border-slate-300 transition-colors">
+                            <h3 className="text-lg font-bold text-slate-800 mb-4 border-b border-slate-100 pb-2">직급 관리</h3>
+                            <div className="flex gap-2 mb-4"><input type="text" placeholder="직급명 입력" value={newPosition} onChange={e=>setNewPosition(e.target.value)} disabled={isGuest} className="bg-white text-slate-800 p-2.5 rounded border border-slate-200 outline-none focus:border-brand-primary transition-colors flex-1"/><button onClick={addPosition} disabled={isGuest} className="bg-slate-200 text-slate-600 px-3 rounded hover:bg-slate-300 disabled:opacity-50"><Icons.Plus/></button></div>
+                            <div className="flex flex-wrap gap-2">{(local.positions || []).map(pos=><span key={pos} className="bg-violet-50 text-violet-600 border border-violet-100 px-3 py-1 rounded-full text-sm flex items-center gap-2 hover:bg-violet-100 transition-colors">{pos}{!isGuest && <button onClick={()=>removePosition(pos)} className="hover:text-violet-800"><Icons.X/></button>}</span>)}</div>
                         </div>
                         <div className="glass-panel p-6 rounded-xl md:col-span-2 hover:border-slate-300 transition-colors">
                             <h3 className="text-lg font-bold text-slate-800 mb-4 border-b border-slate-100 pb-2">표준 제품 관리</h3>
@@ -1025,7 +2118,7 @@
                                         <p className="text-xs text-slate-500 mb-4">계정 생성 및 데이터 초기화를 위해 비밀번호를 입력하세요.</p>
                                         <div className="flex gap-2 w-full">
                                             <input type="password" value={password} onChange={(e) => {setPassword(e.target.value); setError('');}} onKeyDown={(e) => e.key === 'Enter' && verifyPassword()} className="bg-white border border-red-200 rounded p-2 text-sm outline-none focus:border-red-400 flex-1 text-center" placeholder="Password" />
-                                            <button onClick={verifyPassword} className="bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600 transition-colors text-sm font-bold">확인</button>
+                                            <button onClick={verifyPassword} disabled={verifying} className="bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600 transition-colors text-sm font-bold disabled:opacity-60">{verifying ? '확인 중...' : '확인'}</button>
                                         </div>
                                         {error && <p className="text-red-600 text-xs mt-2 font-bold animate-pulse">{error}</p>}
                                     </div>
@@ -1037,10 +2130,20 @@
                                         <form onSubmit={handleCreateUser} className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                             <Input label="이름" required value={newUserName} onChange={e=>setNewUserName(e.target.value)} placeholder="홍길동" />
                                             <Input label="아이디 (ID)" type="text" required value={newUserId} onChange={e=>setNewUserId(e.target.value)} placeholder="user_id" />
-                                            <Input label="초기 비밀번호" type="text" required value={newUserPass} onChange={e=>setNewUserPass(e.target.value)} placeholder="최소 6자 이상" />
-                                            <div className="grid grid-cols-2 gap-2">
-                                                <div><label className="block text-xs text-slate-500 mb-1 font-medium">부서</label><input list="deptListSetting" value={newUserDept} onChange={e=>setNewUserDept(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded p-2.5 outline-none focus:border-brand-primary" /><datalist id="deptListSetting">{local.departments.map(d=><option key={d} value={d}/>)}</datalist></div>
-                                                <Input label="직급" value={newUserPos} onChange={e=>setNewUserPos(e.target.value)} placeholder="대리" />
+                                            <Input label="초기 비밀번호" type="password" required value={newUserPass} onChange={e=>setNewUserPass(e.target.value)} placeholder="최소 6자 이상" minLength="6" />
+                                            <div className="grid grid-cols-3 gap-2 md:col-span-2">
+                                                <Select label="부서" required value={newUserDept} onChange={e=>setNewUserDept(e.target.value)}>
+                                                    <option value="">선택</option>
+                                                    {local.departments.map(d=><option key={d} value={d}>{d}</option>)}
+                                                </Select>
+                                                <Select label="팀" required value={newUserTeam} onChange={e=>setNewUserTeam(e.target.value)}>
+                                                    <option value="">선택</option>
+                                                    {(local.departments || []).map(t=><option key={t} value={t}>{t}</option>)}
+                                                </Select>
+                                                <Select label="직급" required value={newUserPos} onChange={e=>setNewUserPos(e.target.value)}>
+                                                    <option value="">선택</option>
+                                                    {(local.positions || []).map(pos=><option key={pos} value={pos}>{pos}</option>)}
+                                                </Select>
                                             </div>
                                             <div className="md:col-span-2 pt-2">
                                                 <button type="submit" disabled={creatingUser} className="bg-brand-primary text-white px-4 py-2 rounded-lg font-bold hover:bg-blue-600 shadow w-full disabled:opacity-50">
@@ -1051,36 +2154,117 @@
                                     </div>
 
                                     <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
+                                        <h4 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><Icons.Lock /> 회원가입 승인 대기</h4>
+                                        {pendingRequests.length > 0 ? (
+                                            <div className="overflow-x-auto">
+                                                <table className="w-full text-sm text-left">
+                                                    <thead className="bg-slate-50 text-slate-500 border-b">
+                                                        <tr>
+                                                            <th className="p-3">신청자</th>
+                                                            <th className="p-3">아이디</th>
+                                                            <th className="p-3">부서/팀/직급</th>
+                                                            <th className="p-3">신청일시</th>
+                                                            <th className="p-3 text-right">처리</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-100">
+                                                        {pendingRequests.map((requestItem) => (
+                                                            <tr key={requestItem.id} className="hover:bg-slate-50">
+                                                                <td className="p-3 font-bold text-slate-700">{requestItem.name || '-'}</td>
+                                                                <td className="p-3 text-slate-500 font-mono">{requestItem.userId || '-'}</td>
+                                                                <td className="p-3 text-slate-600">{requestItem.department || '-'} / {requestItem.team || '-'} / {requestItem.position || '-'}</td>
+                                                                <td className="p-3 text-slate-500 whitespace-nowrap">{requestItem.requestedAt ? new Date(requestItem.requestedAt).toLocaleString() : '-'}</td>
+                                                                <td className="p-3">
+                                                                    <div className="flex justify-end gap-2">
+                                                                        <button onClick={() => handleApproveSignup(requestItem)} className="text-xs bg-emerald-50 text-emerald-700 px-2 py-1 rounded border border-emerald-100 hover:bg-emerald-100">승인</button>
+                                                                        <button onClick={() => handleRejectSignup(requestItem)} className="text-xs bg-red-50 text-red-600 px-2 py-1 rounded border border-red-100 hover:bg-red-100">반려</button>
+                                                                    </div>
+                                                                </td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        ) : (
+                                            <p className="text-sm text-slate-400 text-center py-6">승인 대기 중인 가입 신청이 없습니다.</p>
+                                        )}
+                                    </div>
+
+                                    <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
                                         <h4 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><Icons.Users /> 등록된 사용자 계정 목록</h4>
                                         <div className="overflow-x-auto">
                                             <table className="w-full text-sm text-left">
-                                                <thead className="bg-slate-50 text-slate-500 border-b">
-                                                    <tr>
-                                                        <th className="p-3">이름</th>
-                                                        <th className="p-3">아이디</th>
-                                                        <th className="p-3">부서</th>
-                                                        <th className="p-3">직급</th>
-                                                        <th className="p-3 text-right">관리</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody className="divide-y divide-slate-100">
-                                                    {data.members.filter(m => m.userId).map(member => (
+                                                    <thead className="bg-slate-50 text-slate-500 border-b">
+                                                        <tr>
+                                                            <th className="p-3">이름</th>
+                                                            <th className="p-3">아이디</th>
+                                                            <th className="p-3">부서</th>
+                                                            <th className="p-3">팀</th>
+                                                            <th className="p-3">직급</th>
+                                                            <th className="p-3">상태</th>
+                                                            <th className="p-3 text-right">관리</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-100">
+                                                        {data.members.filter(m => m.userId).map(member => (
                                                         <tr key={member.id} className="hover:bg-slate-50">
                                                             <td className="p-3 font-bold text-slate-700">{member.name}</td>
                                                             <td className="p-3 text-slate-500 font-mono">{member.userId}</td>
                                                             <td className="p-3 text-slate-600">{member.department}</td>
+                                                            <td className="p-3 text-slate-600">{member.team || '-'}</td>
                                                             <td className="p-3 text-slate-600">{member.position}</td>
+                                                            <td className="p-3">
+                                                                <span className={`text-xs px-2 py-1 rounded border font-bold ${member.isActive === false ? 'bg-red-50 text-red-600 border-red-200' : 'bg-emerald-50 text-emerald-700 border-emerald-200'}`}>
+                                                                    {member.isActive === false ? '비활성' : '활성'}
+                                                                </span>
+                                                            </td>
                                                             <td className="p-3 text-right flex justify-end gap-2">
-                                                                <button onClick={() => handleChangePassword(member)} className="text-xs bg-slate-100 text-slate-600 px-2 py-1 rounded border hover:bg-slate-200">비번변경</button>
-                                                                <button onClick={() => handleDeleteAccount(member)} className="text-xs bg-red-50 text-red-500 px-2 py-1 rounded border border-red-100 hover:bg-red-100">삭제</button>
+                                                                <button onClick={() => handleChangePassword(member)} className="text-xs bg-slate-100 text-slate-600 px-2 py-1 rounded border hover:bg-slate-200">재설정 안내</button>
+                                                                <button onClick={() => handleTransferOwnership(member)} className="text-xs bg-blue-50 text-blue-700 px-2 py-1 rounded border border-blue-100 hover:bg-blue-100">소유권 이관</button>
+                                                                {member.isActive === false
+                                                                    ? <button onClick={() => handleEnableAccount(member)} className="text-xs bg-emerald-50 text-emerald-700 px-2 py-1 rounded border border-emerald-100 hover:bg-emerald-100">활성화</button>
+                                                                    : <button onClick={() => handleDisableAccount(member)} className="text-xs bg-amber-50 text-amber-700 px-2 py-1 rounded border border-amber-100 hover:bg-amber-100">비활성화</button>
+                                                                }
+                                                                <button onClick={() => handleDeleteAccount(member)} className="text-xs bg-red-50 text-red-500 px-2 py-1 rounded border border-red-100 hover:bg-red-100">소프트삭제</button>
                                                             </td>
                                                         </tr>
                                                     ))}
                                                     {data.members.filter(m => m.userId).length === 0 && (
-                                                        <tr><td colSpan="5" className="p-4 text-center text-slate-400">등록된 계정이 없습니다.</td></tr>
+                                                        <tr><td colSpan="7" className="p-4 text-center text-slate-400">등록된 계정이 없습니다.</td></tr>
                                                     )}
                                                 </tbody>
                                             </table>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
+                                        <h4 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><Icons.Trash /> 소프트삭제 복구</h4>
+                                        <p className="text-xs text-slate-500 mb-3">삭제된 데이터 {deletedCount}건을 복구할 수 있습니다.</p>
+                                        <div className="space-y-3">
+                                            {deletedCollections.map((col) => {
+                                                const rows = data.deleted?.[col] || [];
+                                                return (
+                                                    <div key={col} className="border rounded-lg p-3 bg-slate-50">
+                                                        <p className="text-sm font-bold text-slate-700 mb-2">{deletedColLabel[col] || col} ({rows.length}건)</p>
+                                                        {rows.length > 0 ? (
+                                                            <div className="flex flex-wrap gap-2">
+                                                                {rows.slice(0, 8).map((row) => (
+                                                                    <button
+                                                                        key={row.id}
+                                                                        onClick={() => onRestoreDeletedItem?.(col, row.id)}
+                                                                        className="text-xs bg-white border border-slate-200 px-2 py-1 rounded hover:bg-slate-100"
+                                                                    >
+                                                                        복구: {row.title || row.name || row.id}
+                                                                    </button>
+                                                                ))}
+                                                                {rows.length > 8 && <span className="text-xs text-slate-500 px-1 py-1">외 {rows.length - 8}건</span>}
+                                                            </div>
+                                                        ) : (
+                                                            <p className="text-xs text-slate-400">삭제 항목 없음</p>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })}
                                         </div>
                                     </div>
 
@@ -1445,6 +2629,7 @@
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
+                URL.revokeObjectURL(url);
             };
 
             const handleFileUpload = (e) => {
@@ -1532,8 +2717,12 @@
                                         currentItems.map(c => (
                                             <tr key={c.id} className="hover:bg-slate-50 transition-colors">
                                                 <td className="px-6 py-4">
-                                                    <div className="font-bold text-slate-800 text-base">{c.name}</div>
+                                                    <div className="font-bold text-slate-800 text-base flex items-center gap-2">
+                                                        <span>{c.name}</span>
+                                                        {c._lock && <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-50 text-red-600 border-red-200">편집중:{c._lock.userName || c._lock.userId}</span>}
+                                                    </div>
                                                     <div className="text-xs text-slate-400 mt-0.5">{c.email || '-'}</div>
+                                                    <div className="text-[10px] text-slate-400 mt-1">최근수정: {c.lastEditedBy || '-'} / {(c.lastEditedAt || '').slice(0,16).replace('T',' ') || '-'}</div>
                                                 </td>
                                                 <td className="px-6 py-4">
                                                     <span className={`px-2 py-0.5 rounded text-[10px] font-bold border inline-block mb-1 ${
@@ -1620,14 +2809,17 @@
             );
         };
         
-        const MemberList = ({ data, onAdd, onEdit, onDelete, isGuest }) => (
-            <div className="space-y-6 animate-slide-up">
-                <div className="flex justify-between items-center"><h2 className="text-2xl font-bold text-slate-800">업무 담당자 관리</h2>{!isGuest && <button onClick={onAdd} className="bg-brand-primary text-white px-4 py-2 rounded-lg font-bold hover:bg-blue-600 shadow-lg shadow-blue-500/20"><Icons.UserPlus /> 담당자 추가</button>}</div>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">{data.members.map(m=>(<div key={m.id} className="glass-panel p-6 rounded-xl relative group hover:border-brand-primary/30"><div className="flex items-center gap-4"><div className={`w-12 h-12 rounded-full flex items-center justify-center text-white font-bold text-lg shadow-md ${m.color||'bg-slate-500'}`}>{m.name.charAt(0)}</div><div><p className="text-xs text-brand-primary font-bold">{m.department}</p><h3 className="font-bold text-lg">{m.name}</h3><p className="text-sm text-slate-500">{m.position}</p></div></div>{!isGuest && <div className="mt-4 pt-4 border-t flex justify-end opacity-0 group-hover:opacity-100 transition-opacity"><button onClick={()=>onEdit(m)} className="p-1.5 hover:bg-slate-100 rounded text-slate-400"><Icons.Edit/></button><button onClick={()=>onDelete(m.id)} className="p-1.5 hover:bg-red-50 rounded text-red-400"><Icons.Trash/></button></div>}</div>))}</div>
-            </div>
-        );
+        const MemberList = ({ data, onAdd, onEdit, onDelete, isGuest, isMaster }) => {
+            const canManage = !isGuest && isMaster;
+            return (
+                <div className="space-y-6 animate-slide-up">
+                    <div className="flex justify-between items-center"><h2 className="text-2xl font-bold text-slate-800">업무 담당자 관리</h2>{canManage && <button onClick={onAdd} className="bg-brand-primary text-white px-4 py-2 rounded-lg font-bold hover:bg-blue-600 shadow-lg shadow-blue-500/20"><Icons.UserPlus /> 담당자 추가</button>}</div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">{data.members.map(m=>(<div key={m.id} className="glass-panel p-6 rounded-xl relative group hover:border-brand-primary/30"><div className="flex items-center gap-4"><div className={`w-12 h-12 rounded-full flex items-center justify-center text-white font-bold text-lg shadow-md ${m.color||'bg-slate-500'}`}>{m.name.charAt(0)}</div><div><p className="text-xs text-brand-primary font-bold">{m.department}</p><h3 className="font-bold text-lg">{m.name}</h3><p className="text-sm text-slate-500">{m.team || '-'} / {m.position}</p><span className={`text-[10px] px-1.5 py-0.5 rounded border font-bold inline-block mt-1 ${m.isActive === false ? 'bg-red-50 text-red-600 border-red-200' : 'bg-emerald-50 text-emerald-700 border-emerald-200'}`}>{m.isActive === false ? '비활성' : '활성'}</span></div></div>{canManage && <div className="mt-4 pt-4 border-t flex justify-end opacity-0 group-hover:opacity-100 transition-opacity"><button onClick={()=>onEdit(m)} className="p-1.5 hover:bg-slate-100 rounded text-slate-400"><Icons.Edit/></button><button onClick={()=>onDelete(m.id)} className="p-1.5 hover:bg-red-50 rounded text-red-400"><Icons.Trash/></button></div>}</div>))}</div>
+                </div>
+            );
+        };
 
-        const Pipeline = ({ data, onAdd, onEdit, onDelete, updateStage, isGuest }) => {
+        const Pipeline = ({ data, onAdd, onEdit, onDelete, updateStage, isGuest, currentUserId }) => {
             const [year, setYear] = useState(new Date().getFullYear().toString());
             const [searchQuery, setSearchQuery] = useState('');
             const [stageFilter, setStageFilter] = useState('all');
@@ -1763,12 +2955,17 @@
                                             const assignee = getAssignee(d.assigneeId);
                                             const stageAge = daysSince(d.lastUpdateDate);
                                             const dday = daysLeft(d.targetDate);
+                                            const isLockedByOther = d?._lock && String(d._lock.userId || "").toLowerCase() !== String(currentUserId || "").toLowerCase();
                                             return (
                                                 <tr key={d.id} className="hover:bg-slate-50">
                                                     {!isGuest && <td className="px-4 py-3"><input type="checkbox" checked={selectedIds.includes(d.id)} onChange={()=>toggleSelect(d.id)} /></td>}
                                                     <td className="px-4 py-3">
-                                                        <div className="font-bold text-slate-800">{d.title}</div>
+                                                        <div className="font-bold text-slate-800 flex items-center gap-2">
+                                                            <span>{d.title}</span>
+                                                            {isLockedByOther && <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-50 text-red-600 border-red-200">편집중:{d._lock.userName || d._lock.userId}</span>}
+                                                        </div>
                                                         <div className="text-xs text-slate-500">{d.product}</div>
+                                                        <div className="text-[10px] text-slate-400 mt-1">최근수정: {d.lastEditedBy || '-'} / {(d.lastEditedAt || '').slice(0, 16).replace('T',' ') || '-'}</div>
                                                     </td>
                                                     <td className="px-4 py-3">{data.customers.find(c=>c.id===d.customerId)?.name || '-'}</td>
                                                     <td className="px-4 py-3">{stages.find(s=>s.id===d.stage)?.label || d.stage}</td>
@@ -1806,6 +3003,7 @@
                                             const assignee = getAssignee(d.assigneeId);
                                             const stageAge = daysSince(d.lastUpdateDate);
                                             const dday = daysLeft(d.targetDate);
+                                            const isLockedByOther = d?._lock && String(d._lock.userId || "").toLowerCase() !== String(currentUserId || "").toLowerCase();
                                             return (
                                             <div key={d.id} className={`glass-panel p-4 rounded-lg bg-white group relative ${!isGuest && 'cursor-pointer hover:border-brand-primary/40'}`} onClick={()=>!isGuest && onEdit(d)}>
                                                 {!isGuest && <input type="checkbox" className="absolute left-2 top-2" checked={selectedIds.includes(d.id)} onClick={(e)=>e.stopPropagation()} onChange={()=>toggleSelect(d.id)} />}
@@ -1813,6 +3011,7 @@
                                                     <span className="text-xs bg-amber-50 text-amber-600 px-1.5 rounded border border-amber-100 font-bold">{d.product}</span>
                                                     <span className="text-xs text-slate-400">{d.probability}%</span>
                                                 </div>
+                                                {isLockedByOther && <div className="text-[10px] mb-2 px-1.5 py-0.5 rounded border bg-red-50 text-red-600 border-red-200 inline-block">편집중: {d._lock.userName || d._lock.userId}</div>}
                                                 <div className="flex justify-between items-center mb-2">
                                                     <span className={`text-[10px] px-1.5 rounded border font-bold ${d.riskLevel==='High'?'bg-red-50 text-red-600 border-red-200':d.riskLevel==='Medium'?'bg-orange-50 text-orange-600 border-orange-200':'bg-emerald-50 text-emerald-600 border-emerald-200'}`}>{d.riskLevel || 'Medium'}</span>
                                                     <span className="text-[10px] text-slate-400">룰기준 {d.probabilityRule ?? '-'}%</span>
@@ -1823,6 +3022,7 @@
                                                 </div>
                                                 <h4 className="text-sm font-bold text-slate-800 truncate">{d.title}</h4><p className="text-xs text-slate-500 mb-3">{data.customers.find(c=>c.id===d.customerId)?.name}</p>
                                                 {d.nextAction && <p className="text-[10px] text-slate-500 mb-2 truncate">다음 액션: {d.nextAction}</p>}
+                                                <p className="text-[10px] text-slate-400 mb-2 truncate">최근수정: {d.lastEditedBy || '-'} / {(d.lastEditedAt || '').slice(0, 16).replace('T',' ') || '-'}</p>
                                                 <div className="flex justify-between pt-3 border-t">
                                                     <div className="flex items-center gap-2">
                                                         <div className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] text-white font-bold shadow-sm ${assignee?.color || 'bg-slate-400'}`}>
@@ -1848,7 +3048,7 @@
             );
         };
 
-        const ProjectManagement = ({ data, onAdd, onEdit, onDelete, updateStatus, isGuest }) => {
+        const ProjectManagement = ({ data, onAdd, onEdit, onDelete, updateStatus, isGuest, currentUserId }) => {
             const [year, setYear] = useState(new Date().getFullYear().toString());
             const [searchQuery, setSearchQuery] = useState('');
             const [statusFilter, setStatusFilter] = useState('all');
@@ -1990,12 +3190,17 @@
                                             const assignee = getAssignee(p.assigneeId);
                                             const stageAge = daysSince(p.startDate);
                                             const dday = daysLeft(p.dueDate);
+                                            const isLockedByOther = p?._lock && String(p._lock.userId || "").toLowerCase() !== String(currentUserId || "").toLowerCase();
                                             return (
                                                 <tr key={p.id} className="hover:bg-slate-50">
                                                     {!isGuest && <td className="px-4 py-3"><input type="checkbox" checked={selectedIds.includes(p.id)} onChange={()=>toggleSelect(p.id)} /></td>}
                                                     <td className="px-4 py-3">
-                                                        <div className="font-bold text-slate-800">{p.title}</div>
+                                                        <div className="font-bold text-slate-800 flex items-center gap-2">
+                                                            <span>{p.title}</span>
+                                                            {isLockedByOther && <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-50 text-red-600 border-red-200">편집중:{p._lock.userName || p._lock.userId}</span>}
+                                                        </div>
                                                         <div className="text-xs text-slate-500">{p.priority || '-'}</div>
+                                                        <div className="text-[10px] text-slate-400 mt-1">최근수정: {p.lastEditedBy || '-'} / {(p.lastEditedAt || '').slice(0, 16).replace('T',' ') || '-'}</div>
                                                     </td>
                                                     <td className="px-4 py-3">{data.customers.find(c=>c.id===p.customerId)?.name || '-'}</td>
                                                     <td className="px-4 py-3">{stages.find(s=>s.id===p.status)?.label || p.status}</td>
@@ -2036,6 +3241,7 @@
                                             const deal = data.deals.find(d => d.id === p.dealId);
                                             const stageAge = daysSince(p.startDate);
                                             const dday = daysLeft(p.dueDate);
+                                            const isLockedByOther = p?._lock && String(p._lock.userId || "").toLowerCase() !== String(currentUserId || "").toLowerCase();
                                             return (
                                             <div key={p.id} className={`glass-panel p-4 rounded-lg bg-white group relative ${!isGuest && 'cursor-pointer hover:border-slate-400'}`} onClick={()=>!isGuest && onEdit(p)}>
                                                 {!isGuest && <input type="checkbox" className="absolute left-2 top-2" checked={selectedIds.includes(p.id)} onClick={(e)=>e.stopPropagation()} onChange={()=>toggleSelect(p.id)} />}
@@ -2049,6 +3255,8 @@
                                                 </div>
                                                 <h4 className="text-sm font-bold text-slate-800 truncate mb-1">{p.title}</h4>
                                                 <p className="text-xs text-slate-500 mb-3">{data.customers.find(c=>c.id===p.customerId)?.name}</p>
+                                                {isLockedByOther && <div className="text-[10px] mb-2 px-1.5 py-0.5 rounded border bg-red-50 text-red-600 border-red-200 inline-block">편집중: {p._lock.userName || p._lock.userId}</div>}
+                                                <p className="text-[10px] text-slate-400 mb-2 truncate">최근수정: {p.lastEditedBy || '-'} / {(p.lastEditedAt || '').slice(0, 16).replace('T',' ') || '-'}</p>
                                                 
                                                 {deal && (
                                                     <div className="text-[10px] bg-slate-50 p-1.5 rounded mb-3 border border-slate-100 flex items-center gap-1 text-slate-500">
@@ -2179,8 +3387,12 @@
                                                 <td className="px-6 py-4 text-xs font-mono">{i.date}</td>
                                                 <td className="px-6 py-4 font-bold" style={{color:i.severity==='High'?'#ef4444':i.severity==='Medium'?'#f97316':'#3b82f6'}}>{i.severity}</td>
                                                 <td className="px-6 py-4">
-                                                    <div className="font-bold text-slate-800">{i.title}</div>
+                                                    <div className="font-bold text-slate-800 flex items-center gap-2">
+                                                        <span>{i.title}</span>
+                                                        {i._lock && <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-50 text-red-600 border-red-200">편집중:{i._lock.userName || i._lock.userId}</span>}
+                                                    </div>
                                                     <div className="text-xs text-slate-500">{i.product}</div>
+                                                    <div className="text-[10px] text-slate-400 mt-1">최근수정: {i.lastEditedBy || '-'} / {(i.lastEditedAt || '').slice(0,16).replace('T',' ') || '-'}</div>
                                                 </td>
                                                 <td className="px-6 py-4">
                                                     {data.customers.find(c=>c.id===i.customerId)?.name || '-'}
@@ -2260,19 +3472,111 @@
             const [currentUser, setCurrentUser] = useState(null); 
             const [loading, setLoading] = useState(true);
             const isGuest = currentUser?.isGuest;
-            const isMaster = currentUser?.id === 'master';
-            
+            const isMaster = currentUser?.role === 'admin';
+            const [viewScope, setViewScope] = useState('mine');
+             
             const [tab, setTab] = useState('dashboard');
             const [toast, setToast] = useState(null);
             const { data, isCloudConnected, ...actions } = useDataManager(currentUser, setToast);
             const [modal, setModal] = useState(null);
             const [editItem, setEditItem] = useState(null);
-            const close = () => { setModal(null); setEditItem(null); };
-            const open = (type, item=null) => { setModal(type); setEditItem(item); };
+            const [activeLock, setActiveLock] = useState(null);
+            const typeToCollection = { customer: "customers", deal: "deals", project: "projects", member: "members", issue: "issues" };
+            const normalize = (value) => String(value || "").trim().toLowerCase();
+            const userId = normalize(currentUser?.id);
+            const userTeam = String(currentUser?.team || currentUser?.department || "").trim();
+            const userMemberId = String(currentUser?.memberDocId || "");
+            const lockMap = useMemo(() => {
+                const map = new Map();
+                (data.editLocks || []).forEach((lock) => {
+                    map.set(`${lock.collection}:${lock.itemId}`, lock);
+                });
+                return map;
+            }, [data.editLocks]);
 
             useEffect(() => {
-                const timer = setTimeout(() => setLoading(false), 800);
-                return () => clearTimeout(timer);
+                setViewScope(isMaster ? 'all' : 'mine');
+            }, [isMaster, currentUser?.id]);
+
+            const canViewScopedItem = (item) => {
+                if (!item) return false;
+                if (isMaster && viewScope === 'all') return true;
+                const ownerId = normalize(item.ownerId);
+                const teamId = String(item.teamId || "").trim();
+                const assigneeId = String(item.assigneeId || "");
+                const mine = ownerId ? ownerId === userId : (assigneeId && assigneeId === userMemberId);
+                if (viewScope === 'mine') {
+                    if (!ownerId && !teamId && !assigneeId) return true;
+                    return mine || assigneeId === userMemberId;
+                }
+                if (viewScope === 'team') {
+                    if (mine || assigneeId === userMemberId) return true;
+                    if (!teamId) return false;
+                    return userTeam && teamId === userTeam;
+                }
+                return isMaster;
+            };
+
+            const withLock = (col, items) => (items || []).map((item) => ({
+                ...item,
+                _lock: lockMap.get(`${col}:${item.id}`) || null
+            }));
+
+            const scopedData = useMemo(() => ({
+                ...data,
+                customers: withLock("customers", (data.customers || []).filter((item) => canViewScopedItem(item))),
+                deals: withLock("deals", (data.deals || []).filter((item) => canViewScopedItem(item))),
+                issues: withLock("issues", (data.issues || []).filter((item) => canViewScopedItem(item))),
+                projects: withLock("projects", (data.projects || []).filter((item) => canViewScopedItem(item)))
+            }), [data, viewScope, userId, userTeam, userMemberId, lockMap, isMaster]);
+
+            const close = () => {
+                if (activeLock?.col && activeLock?.id) {
+                    actions.releaseEditLock?.(activeLock.col, activeLock.id);
+                }
+                setActiveLock(null);
+                setModal(null);
+                setEditItem(null);
+            };
+            const open = async (type, item=null) => {
+                if (item?.id && typeToCollection[type]) {
+                    const col = typeToCollection[type];
+                    const lockResult = await actions.acquireEditLock?.(col, item.id);
+                    if (lockResult && lockResult.ok === false) {
+                        setToast(lockResult.message || "다른 사용자가 편집 중입니다.");
+                        return;
+                    }
+                    setActiveLock({ col, id: item.id });
+                } else {
+                    setActiveLock(null);
+                }
+                setModal(type);
+                setEditItem(item);
+            };
+
+            useEffect(() => {
+                const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
+                    if (!firebaseUser) {
+                        setCurrentUser(null);
+                        setLoading(false);
+                        return;
+                    }
+                    try {
+                        const approvedUser = await resolveApprovedUser(firebaseUser);
+                        if (!approvedUser) {
+                            await signOut(auth);
+                            setCurrentUser(null);
+                        } else {
+                            setCurrentUser(approvedUser);
+                        }
+                    } catch (e) {
+                        console.error("[authStateChanged]", e);
+                        setCurrentUser(null);
+                    } finally {
+                        setLoading(false);
+                    }
+                });
+                return () => unsub();
             }, []);
 
             const handleLogin = (user) => {
@@ -2280,12 +3584,8 @@
                 setTab('dashboard');
             };
 
-            const handleGuest = () => {
-                setCurrentUser({ id: 'guest', name: '비회원', isGuest: true });
-                setTab('dashboard');
-            };
-
             const handleLogout = () => {
+                signOut(auth).catch(() => {});
                 setCurrentUser(null);
             };
 
@@ -2311,7 +3611,7 @@
             }
 
             if (!currentUser) {
-                return <AuthPage onLogin={handleLogin} onGuest={handleGuest} />;
+                return <AuthPage onLogin={handleLogin} onRequestSignup={actions.signUpRequest} signupOptions={data.settings} />;
             }
 
             return (
@@ -2339,13 +3639,29 @@
                         </div>
                     </div>
                     <main className="flex-1 ml-64 p-8 overflow-y-auto h-screen"><div className="max-w-7xl mx-auto h-full">
-                        {tab==='dashboard'&&<Dashboard data={data} onCreateSnapshot={actions.createMonthlySnapshot} isGuest={isGuest} />}
-                        {tab==='pipeline'&&<Pipeline data={data} onAdd={()=>open('deal')} onEdit={i=>open('deal',i)} onDelete={actions.deleteDeal} updateStage={actions.updateDealStage} isGuest={isGuest}/>}
-                        {tab==='projects'&&<ProjectManagement data={data} onAdd={()=>open('project')} onEdit={i=>open('project',i)} onDelete={actions.deleteProject} updateStatus={actions.updateProjectStatus} isGuest={isGuest}/>}
-                        {tab==='customers'&&<CustomerList data={data} onAdd={()=>open('customer')} onEdit={i=>open('customer',i)} onDelete={actions.deleteCustomer} onBulkAdd={actions.addCustomer} isGuest={isGuest}/>}
-                        {tab==='members'&&<MemberList data={data} onAdd={()=>open('member')} onEdit={i=>open('member',i)} onDelete={actions.deleteMember} isGuest={isGuest}/>}
-                        {tab==='issues'&&<IssueTracker data={data} onAdd={()=>open('issue')} onEdit={i=>open('issue',i)} onDelete={actions.deleteIssue} onUpdate={actions.updateIssue} isGuest={isGuest}/>}
-                        {tab==='settings'&&<SettingsView settings={data.settings} data={data} onUpdateSettings={actions.updateSettings} onResetAll={actions.resetAllData} onResetYear={actions.resetYearData} onMasterCreateUser={actions.masterCreateUser} onUpdateMemberPassword={actions.updateMemberPassword} onDeleteMember={actions.deleteMember} onBackupData={actions.backupAllData} isMaster={isMaster} isGuest={isGuest} />}
+                        {tab !== 'settings' && (
+                            <div className="mb-4 flex justify-end">
+                                <div className="flex items-center gap-2 text-sm">
+                                    <span className="text-slate-500">조회 범위</span>
+                                    <select
+                                        value={viewScope}
+                                        onChange={(e) => setViewScope(e.target.value)}
+                                        className="bg-white border border-slate-200 rounded px-3 py-1.5 text-slate-700 font-semibold"
+                                    >
+                                        <option value="mine">본인</option>
+                                        <option value="team">팀</option>
+                                        {isMaster && <option value="all">전체</option>}
+                                    </select>
+                                </div>
+                            </div>
+                        )}
+                        {tab==='dashboard'&&<Dashboard data={scopedData} onCreateSnapshot={actions.createMonthlySnapshot} isGuest={isGuest} />}
+                        {tab==='pipeline'&&<Pipeline data={scopedData} onAdd={()=>open('deal')} onEdit={i=>open('deal',i)} onDelete={actions.deleteDeal} updateStage={actions.updateDealStage} isGuest={isGuest} currentUserId={currentUser?.id} />}
+                        {tab==='projects'&&<ProjectManagement data={scopedData} onAdd={()=>open('project')} onEdit={i=>open('project',i)} onDelete={actions.deleteProject} updateStatus={actions.updateProjectStatus} isGuest={isGuest} currentUserId={currentUser?.id} />}
+                        {tab==='customers'&&<CustomerList data={scopedData} onAdd={()=>open('customer')} onEdit={i=>open('customer',i)} onDelete={actions.deleteCustomer} onBulkAdd={actions.addCustomer} isGuest={isGuest}/>}
+                        {tab==='members'&&<MemberList data={data} onAdd={()=>open('member')} onEdit={i=>open('member',i)} onDelete={actions.deleteMember} isGuest={isGuest} isMaster={isMaster}/>}
+                        {tab==='issues'&&<IssueTracker data={scopedData} onAdd={()=>open('issue')} onEdit={i=>open('issue',i)} onDelete={actions.deleteIssue} onUpdate={actions.updateIssue} isGuest={isGuest}/>}
+                        {tab==='settings'&&<SettingsView settings={data.settings} data={data} onUpdateSettings={actions.updateSettings} onResetAll={actions.resetAllData} onResetYear={actions.resetYearData} onMasterCreateUser={actions.masterCreateUser} onUpdateMemberPassword={actions.updateMemberPassword} onChangeMyPassword={actions.changeMyPassword} onDeleteMember={actions.deleteMember} onSetMemberActive={actions.setMemberActiveStatus} onTransferOwnership={actions.transferOwnership} onRestoreDeletedItem={actions.restoreSoftDeletedItem} onBackupData={actions.backupAllData} onApproveSignUp={actions.approveSignUpRequest} onRejectSignUp={actions.rejectSignUpRequest} isMaster={isMaster} isGuest={isGuest} />}
                     </div></main>
                     
                     <Modal isOpen={modal==='customer'} onClose={close} title={editItem?"고객사 수정":"신규 고객사"}> <CustomerForm initialData={editItem} onSubmit={d=>{editItem?actions.updateCustomer({...d,id:editItem.id}):actions.addCustomer(d);close();}} onCancel={close}/></Modal>
