@@ -114,7 +114,6 @@
         
         const MASTER_AUTH_DOC = doc(db, "config", "master_auth");
         const AUTH_SESSION_KEY = "m_crm_active_session";
-        const SETTINGS_PUBLIC_CACHE_KEY = "m_crm_public_settings_cache";
         const MASTER_DEFAULT_SALT = "mcrm_master_salt_v1";
         const MASTER_DEFAULT_HASH = "f02beb045050782f530bfe3b1b6df3e78706ae0d22658c02e513551b5e43b79c";
         const MASTER_LEGACY_HASH = "042ae00fea87bd800583c39ed322b89bebd27a11819e7990c3889260a5c5f7f6";
@@ -390,24 +389,7 @@
                 const unsubs = [];
 
                 if (!currentUser) {
-                    setData(prev => {
-                        let cachedSettings = prev.settings || INITIAL_DATA.settings;
-                        try {
-                            const cachedRaw = localStorage.getItem(SETTINGS_PUBLIC_CACHE_KEY);
-                            if (cachedRaw) {
-                                const cached = JSON.parse(cachedRaw);
-                                if (cached && typeof cached === "object") {
-                                    cachedSettings = {
-                                        ...INITIAL_DATA.settings,
-                                        ...cached,
-                                        departments: Array.isArray(cached.departments) && cached.departments.length ? cached.departments : INITIAL_DATA.settings.departments,
-                                        teams: Array.isArray(cached.teams) && cached.teams.length ? cached.teams : (Array.isArray(cached.departments) && cached.departments.length ? cached.departments : INITIAL_DATA.settings.teams)
-                                    };
-                                }
-                            }
-                        } catch (_) {}
-                        return { ...INITIAL_DATA, settings: cachedSettings };
-                    });
+                    setData({ ...INITIAL_DATA });
                     return () => unsubs.forEach(u => u());
                 }
 
@@ -434,13 +416,6 @@
                                 groupTargets: normalizeMonthlyGroupTargets(s.groupTargets)
                             }
                         }));
-                        try {
-                            localStorage.setItem(SETTINGS_PUBLIC_CACHE_KEY, JSON.stringify({
-                                departments: mergedDepartments,
-                                teams: mergedDepartments,
-                                positions: Array.isArray(s.positions) ? s.positions : INITIAL_DATA.settings.positions
-                            }));
-                        } catch (_) {}
                         setIsCloudConnected(true);
                     }
                     else if (isMaster) {
@@ -920,39 +895,58 @@
                 }
             };
 
-            const backupAllData = () => {
+            const backupAllData = async () => {
                 if(isGuest || !isMaster) { denyMasterAction(); return; }
-                const backupData = {
-                    metadata: {
-                        exportedBy: 'Master',
-                        exportedAt: new Date().toISOString(),
-                        version: '2.0'
-                    },
-                    data: {
-                        customers: data.customers,
-                        members: data.members.map(({ password, passwordHash, ...safeMember }) => safeMember),
-                        deals: data.deals,
-                        projects: data.projects,
-                        issues: data.issues,
-                        deleted: data.deleted || {},
-                        settings: data.settings,
-                        logs: data.logs
-                    }
-                };
+                try {
+                    const backupId = `manual-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+                    const savedAt = new Date().toISOString();
+                    const backupRef = doc(db, "cloud_backups", backupId);
+                    const entryCollection = collection(db, "cloud_backups", backupId, "entries");
+                    const rows = [
+                        ...(data.customers || []).map((item) => ({ type: "customers", id: item.id, payload: item })),
+                        ...(data.members || []).map(({ password, passwordHash, ...safeMember }) => ({ type: "members", id: safeMember.id, payload: safeMember })),
+                        ...(data.deals || []).map((item) => ({ type: "deals", id: item.id, payload: item })),
+                        ...(data.projects || []).map((item) => ({ type: "projects", id: item.id, payload: item })),
+                        ...(data.issues || []).map((item) => ({ type: "issues", id: item.id, payload: item })),
+                        ...(data.logs || []).map((item) => ({ type: "logs", id: item.id, payload: item })),
+                        ...((data.signupRequests || []).map((item) => ({ type: "signupRequests", id: item.id, payload: item }))),
+                        ...((data.snapshots || []).map((item) => ({ type: "snapshots", id: item.id || item.yearMonth, payload: item }))),
+                        { type: "settings", id: "config", payload: data.settings || {} },
+                        { type: "deleted", id: "deleted", payload: data.deleted || {} }
+                    ];
 
-                const fileName = `M-CRM_Backup_${new Date().toISOString().slice(0,10)}.json`;
-                const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const link = document.createElement('a');
-                link.href = url;
-                link.setAttribute('download', fileName);
-                document.body.appendChild(link);
-                link.click();
-                document.body.removeChild(link);
-                URL.revokeObjectURL(url);
-                
-                logAction('backup', 'system', 'all', '전체 데이터 백업 파일 다운로드');
-                showToast("데이터 백업 파일이 생성되었습니다.");
+                    await setDoc(backupRef, {
+                        backupId,
+                        savedBy: currentUser?.id || 'master',
+                        savedAt,
+                        source: 'firestore',
+                        version: '3.1',
+                        counts: rows.reduce((acc, row) => {
+                            acc[row.type] = (acc[row.type] || 0) + 1;
+                            return acc;
+                        }, {})
+                    });
+
+                    const chunkSize = 350;
+                    for (let i = 0; i < rows.length; i += chunkSize) {
+                        const batch = writeBatch(db);
+                        rows.slice(i, i + chunkSize).forEach((row, index) => {
+                            batch.set(doc(entryCollection, `${String(i + index + 1).padStart(6, '0')}_${row.type}_${row.id}`), {
+                                type: row.type,
+                                sourceId: row.id,
+                                savedAt,
+                                payload: row.payload
+                            });
+                        });
+                        await batch.commit();
+                    }
+
+                    await logAction('backup', 'cloud_backups', backupId, '전체 데이터 클라우드 백업 저장');
+                    showToast("전체 데이터가 클라우드에 백업되었습니다.");
+                } catch (e) {
+                    console.error("[backupAllData]", e);
+                    showToast("클라우드 백업 저장 실패");
+                }
             };
 
             const updateMemberPassword = async (id, newPassword) => {
@@ -1490,7 +1484,6 @@
         const AuthPage = ({ onLogin, onRequestSignup, signupOptions }) => {
             const [id, setId] = useState('');
             const [password, setPassword] = useState('');
-            const [rememberMe, setRememberMe] = useState(false);
             const [error, setError] = useState('');
             const [loading, setLoading] = useState(false);
             const [showSignup, setShowSignup] = useState(false);
@@ -1510,14 +1503,6 @@
             const positionOptions = (signupOptions?.positions && signupOptions.positions.length)
                 ? signupOptions.positions
                 : (INITIAL_DATA.settings.positions || []);
-
-            useEffect(() => {
-                const savedId = localStorage.getItem('m_crm_saved_id');
-                if (savedId) {
-                    setId(savedId);
-                    setRememberMe(true);
-                }
-            }, []);
 
             useEffect(() => {
                 setSignupForm((prev) => ({
@@ -1546,8 +1531,6 @@
                         throw new Error("관리자 승인 대기 중입니다. 승인 후 로그인해 주세요.");
                     }
 
-                    if (rememberMe) localStorage.setItem('m_crm_saved_id', normalizedId);
-                    else localStorage.removeItem('m_crm_saved_id');
                     sessionStorage.setItem(AUTH_SESSION_KEY, '1');
 
                     onLogin(approvedUser);
@@ -1612,9 +1595,8 @@
                                 <label className="block text-xs text-slate-500 mb-1 font-medium">비밀번호</label>
                                 <input type="password" required value={password} onChange={e => setPassword(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded p-3 outline-none focus:border-brand-primary transition-colors" placeholder="••••••••" />
                             </div>
-                            <div className="flex items-center">
-                                <input id="remember-me" type="checkbox" checked={rememberMe} onChange={(e) => setRememberMe(e.target.checked)} className="w-4 h-4 text-brand-primary border-slate-300 rounded focus:ring-brand-primary cursor-pointer"/>
-                                <label htmlFor="remember-me" className="ml-2 text-sm text-slate-600 cursor-pointer select-none">아이디만 저장</label>
+                            <div className="text-sm text-slate-500 bg-slate-50 border border-slate-200 rounded p-3">
+                                로그인 정보와 업무 데이터는 기기에 저장하지 않고 클라우드 기준으로만 처리합니다.
                             </div>
                             {error && <div className="text-red-500 text-xs font-bold bg-red-50 p-2 rounded">{error}</div>}
                             <button type="submit" disabled={loading} className="w-full bg-brand-primary text-white py-3 rounded-lg font-bold hover:bg-blue-600 transition-colors shadow-lg shadow-blue-500/20 disabled:opacity-50">
@@ -1768,7 +1750,6 @@
 
         const SettingsView = ({ settings, data, onUpdateSettings, onResetAll, onResetYear, onMasterCreateUser, onUpdateMemberPassword, onChangeMyPassword, onDeleteMember, onSetMemberActive, onTransferOwnership, onRestoreDeletedItem, onBackupData, onApproveSignUp, onRejectSignUp, isMaster, isGuest }) => {
             const [local, setLocal] = useState(settings);
-            const SETTINGS_DRAFT_KEY = 'm_crm_settings_draft_v1';
             const [newYear, setNewYear] = useState(''); const [newTarget, setNewTarget] = useState(''); 
             const [newProduct, setNewProduct] = useState(''); const [newDept, setNewDept] = useState(''); const [newPosition, setNewPosition] = useState('');
             const [groupTargetMonth, setGroupTargetMonth] = useState(new Date().toISOString().slice(0, 7));
@@ -1799,9 +1780,7 @@
 
             const updateLocal = (updater) => {
                 setLocal((prev) => {
-                    const next = typeof updater === 'function' ? updater(prev) : updater;
-                    try { localStorage.setItem(SETTINGS_DRAFT_KEY, JSON.stringify(next)); } catch (_) {}
-                    return next;
+                    return typeof updater === 'function' ? updater(prev) : updater;
                 });
                 setSettingsDirty(true);
             };
@@ -1812,30 +1791,6 @@
                     ...((Array.isArray(base) ? base : [])),
                     ...((Array.isArray(extra) ? extra : []))
                 ].map((v) => String(v || '').trim()).filter(Boolean)));
-                try {
-                    const draftRaw = localStorage.getItem(SETTINGS_DRAFT_KEY);
-                    if (draftRaw) {
-                        const draft = JSON.parse(draftRaw);
-                        if (draft && typeof draft === 'object') {
-                            const mergedDepartments = ((Array.isArray(draft.departments) ? draft.departments : []).length
-                                ? draft.departments
-                                : normalizeDepartments(
-                                    draft.departments || settings.departments,
-                                    draft.teams || settings.teams
-                                ));
-                            setLocal({
-                                ...settings,
-                                ...draft,
-                                departments: Array.from(new Set(mergedDepartments.map((v) => String(v || '').trim()).filter(Boolean))),
-                                teams: Array.from(new Set(mergedDepartments.map((v) => String(v || '').trim()).filter(Boolean))),
-                                ownerTargets: draft.ownerTargets || settings.ownerTargets || {},
-                                groupTargets: normalizeMonthlyGroupTargets(draft.groupTargets || settings.groupTargets)
-                            });
-                            setSettingsDirty(true);
-                            return;
-                        }
-                    }
-                } catch (_) {}
                 const mergedDepartments = ((Array.isArray(settings.departments) ? settings.departments : []).length
                     ? settings.departments
                     : normalizeDepartments(settings.departments, settings.teams));
@@ -1852,7 +1807,6 @@
                 const ok = await onUpdateSettings(local);
                 if (ok) {
                     setSettingsDirty(false);
-                    try { localStorage.removeItem(SETTINGS_DRAFT_KEY); } catch (_) {}
                 }
             };
             const addTarget = () => {
@@ -2431,9 +2385,9 @@
 
                                     <div className="bg-blue-50 p-6 rounded-xl border border-blue-100">
                                         <h4 className="font-bold text-blue-700 mb-2 flex items-center gap-2"><Icons.Cloud /> 데이터 백업</h4>
-                                        <p className="text-xs text-slate-500 mb-4">현재 시스템의 모든 데이터(고객, 계약, 프로젝트, 설정, 로그 등)를 JSON 파일로 다운로드합니다.</p>
+                                        <p className="text-xs text-slate-500 mb-4">현재 시스템의 모든 데이터는 클라우드에 저장되며, 데이터 불러오기도 Firestore 기준으로 동작합니다. 필요 시 현재 상태를 클라우드 백업 컬렉션에 별도로 저장합니다.</p>
                                         <button onClick={onBackupData} className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 transition-colors text-sm font-bold shadow flex items-center gap-2">
-                                            <Icons.FileDown /> 전체 데이터 백업 다운로드
+                                            <Icons.Cloud /> 전체 데이터 클라우드 백업 저장
                                         </button>
                                     </div>
                                 </div>
