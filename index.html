@@ -113,6 +113,8 @@
         const getIdFromEmail = (email) => email ? email.split('@')[0] : '';
         
         const MASTER_AUTH_DOC = doc(db, "config", "master_auth");
+        const AUTH_SESSION_KEY = "m_crm_active_session";
+        const SETTINGS_PUBLIC_CACHE_KEY = "m_crm_public_settings_cache";
         const MASTER_DEFAULT_SALT = "mcrm_master_salt_v1";
         const MASTER_DEFAULT_HASH = "f02beb045050782f530bfe3b1b6df3e78706ae0d22658c02e513551b5e43b79c";
         const MASTER_LEGACY_HASH = "042ae00fea87bd800583c39ed322b89bebd27a11819e7990c3889260a5c5f7f6";
@@ -267,7 +269,7 @@
         const AUDIT_EXCLUDE_FIELDS = new Set([
             "updatedAt", "updatedBy", "lastEditedAt", "lastEditedBy",
             "createdAt", "createdBy", "deletedAt", "deletedBy",
-            "lockUpdatedAt", "lockUpdatedBy"
+            "lockUpdatedAt", "lockUpdatedBy", "lockExpiresAt", "lockAcquiredAt"
         ]);
         const summarizeForAudit = (obj) => {
             if (!obj || typeof obj !== "object") return obj;
@@ -387,6 +389,28 @@
             useEffect(() => {
                 const unsubs = [];
 
+                if (!currentUser) {
+                    setData(prev => {
+                        let cachedSettings = prev.settings || INITIAL_DATA.settings;
+                        try {
+                            const cachedRaw = localStorage.getItem(SETTINGS_PUBLIC_CACHE_KEY);
+                            if (cachedRaw) {
+                                const cached = JSON.parse(cachedRaw);
+                                if (cached && typeof cached === "object") {
+                                    cachedSettings = {
+                                        ...INITIAL_DATA.settings,
+                                        ...cached,
+                                        departments: Array.isArray(cached.departments) && cached.departments.length ? cached.departments : INITIAL_DATA.settings.departments,
+                                        teams: Array.isArray(cached.teams) && cached.teams.length ? cached.teams : (Array.isArray(cached.departments) && cached.departments.length ? cached.departments : INITIAL_DATA.settings.teams)
+                                    };
+                                }
+                            }
+                        } catch (_) {}
+                        return { ...INITIAL_DATA, settings: cachedSettings };
+                    });
+                    return () => unsubs.forEach(u => u());
+                }
+
                 unsubs.push(onSnapshot(doc(db, "config", "settings"), (snap) => {
                     if (snap.exists()) {
                         const s = snap.data() || {};
@@ -410,17 +434,19 @@
                                 groupTargets: normalizeMonthlyGroupTargets(s.groupTargets)
                             }
                         }));
+                        try {
+                            localStorage.setItem(SETTINGS_PUBLIC_CACHE_KEY, JSON.stringify({
+                                departments: mergedDepartments,
+                                teams: mergedDepartments,
+                                positions: Array.isArray(s.positions) ? s.positions : INITIAL_DATA.settings.positions
+                            }));
+                        } catch (_) {}
                         setIsCloudConnected(true);
                     }
                     else if (isMaster) {
                         setDoc(doc(db, "config", "settings"), INITIAL_DATA.settings);
                     }
                 }, () => setIsCloudConnected(false)));
-
-                if (!currentUser) {
-                    setData(prev => ({ ...INITIAL_DATA, settings: prev.settings || INITIAL_DATA.settings }));
-                    return () => unsubs.forEach(u => u());
-                }
 
                 if (currentUser?.isGuest) {
                     setData(prev => ({ ...INITIAL_DATA, settings: prev.settings || INITIAL_DATA.settings }));
@@ -450,17 +476,6 @@
                     }, () => setIsCloudConnected(false)));
                 });
 
-                unsubs.push(onSnapshot(collection(db, "edit_locks"), (snap) => {
-                    const nowMs = Date.now();
-                    const locks = snap.docs
-                        .map((lockDoc) => ({ id: lockDoc.id, ...lockDoc.data() }))
-                        .filter((item) => {
-                            const expires = new Date(item.expiresAt || 0).getTime();
-                            return Number.isFinite(expires) && expires > nowMs;
-                        });
-                    setData((prev) => ({ ...prev, editLocks: locks }));
-                }));
-                 
                 // Fetch logs only if admin
                 if (isMaster) {
                     const logQuery = query(collection(db, "logs"), orderBy("timestamp", "desc"));
@@ -715,30 +730,30 @@
 
             const acquireEditLock = async (col, id) => {
                 if (!currentUser || isGuest || !col || !id) return { ok: false, message: "잠금 대상이 올바르지 않습니다." };
-                const lockId = lockDocId(col, id);
-                const lockRef = doc(db, "edit_locks", lockId);
+                const targetRef = doc(db, col, id);
                 const nowMs = Date.now();
                 try {
-                    const snap = await getDoc(lockRef);
-                    if (snap.exists()) {
-                        const lockData = snap.data() || {};
-                        const expiresMs = new Date(lockData.expiresAt || 0).getTime();
-                        const sameUser = String(lockData.userId || "").toLowerCase() === String(currentUser.id || "").toLowerCase();
-                        if (Number.isFinite(expiresMs) && expiresMs > nowMs && !sameUser) {
-                            return { ok: false, message: `${lockData.userName || lockData.userId || "다른 사용자"}님이 편집 중입니다.` };
-                        }
+                    const snap = await getDoc(targetRef);
+                    if (!snap.exists()) {
+                        return { ok: false, message: "편집 대상을 찾을 수 없습니다." };
+                    }
+                    const targetData = snap.data() || {};
+                    const expiresMs = new Date(targetData.lockExpiresAt || 0).getTime();
+                    const sameUser = String(targetData.lockUserId || "").toLowerCase() === String(currentUser.id || "").toLowerCase();
+                    if (Number.isFinite(expiresMs) && expiresMs > nowMs && !sameUser) {
+                        return { ok: false, message: `${targetData.lockUserName || targetData.lockUserId || "다른 사용자"}님이 편집 중입니다.` };
                     }
                     const expiresAt = new Date(nowMs + lockTtlMs).toISOString();
-                    await setDoc(lockRef, {
-                        collection: col,
-                        itemId: id,
-                        uid: currentUser?.uid || "",
-                        userId: currentUser?.id || "",
-                        userName: currentUser?.name || currentUser?.id || "사용자",
-                        teamId: getDefaultTeam(),
-                        acquiredAt: nowIso(),
-                        expiresAt
-                    }, { merge: true });
+                    await updateDoc(targetRef, {
+                        lockUserUid: currentUser?.uid || "",
+                        lockUserId: currentUser?.id || "",
+                        lockUserName: currentUser?.name || currentUser?.id || "사용자",
+                        lockTeamId: getDefaultTeam(),
+                        lockAcquiredAt: nowIso(),
+                        lockExpiresAt: expiresAt,
+                        lockUpdatedAt: nowIso(),
+                        lockUpdatedBy: currentUser?.id || "system"
+                    });
                     return { ok: true };
                 } catch (e) {
                     console.error("[acquireEditLock]", e);
@@ -748,15 +763,23 @@
 
             const releaseEditLock = async (col, id) => {
                 if (!currentUser || !col || !id) return;
-                const lockId = lockDocId(col, id);
-                const lockRef = doc(db, "edit_locks", lockId);
+                const targetRef = doc(db, col, id);
                 try {
-                    const snap = await getDoc(lockRef);
+                    const snap = await getDoc(targetRef);
                     if (!snap.exists()) return;
-                    const lockData = snap.data() || {};
-                    const sameUser = String(lockData.userId || "").toLowerCase() === String(currentUser.id || "").toLowerCase();
+                    const targetData = snap.data() || {};
+                    const sameUser = String(targetData.lockUserId || "").toLowerCase() === String(currentUser.id || "").toLowerCase();
                     if (sameUser || isMaster) {
-                        await deleteDoc(lockRef);
+                        await updateDoc(targetRef, {
+                            lockUserUid: deleteField(),
+                            lockUserId: deleteField(),
+                            lockUserName: deleteField(),
+                            lockTeamId: deleteField(),
+                            lockAcquiredAt: deleteField(),
+                            lockExpiresAt: deleteField(),
+                            lockUpdatedAt: deleteField(),
+                            lockUpdatedBy: deleteField()
+                        });
                     }
                 } catch (e) {
                     console.error("[releaseEditLock]", e);
@@ -1514,6 +1537,7 @@
                     const normalizedId = String(id || '').trim().toLowerCase();
                     if (!normalizedId) throw new Error("아이디를 입력해 주세요.");
                     const email = getEmailFromId(normalizedId);
+                    sessionStorage.setItem(AUTH_SESSION_KEY, '1');
                     await setPersistence(auth, browserSessionPersistence);
                     const credential = await signInWithEmailAndPassword(auth, email, password);
                     const approvedUser = await resolveApprovedUser(credential.user);
@@ -1524,9 +1548,11 @@
 
                     if (rememberMe) localStorage.setItem('m_crm_saved_id', normalizedId);
                     else localStorage.removeItem('m_crm_saved_id');
+                    sessionStorage.setItem(AUTH_SESSION_KEY, '1');
 
                     onLogin(approvedUser);
                 } catch (err) {
+                    sessionStorage.removeItem(AUTH_SESSION_KEY);
                     const msg = String(err?.message || "");
                     if (msg.includes("auth/user-not-found") || msg.includes("auth/invalid-credential")) setError("아이디 또는 비밀번호가 올바르지 않습니다.");
                     else if (msg.includes("auth/wrong-password")) setError("아이디 또는 비밀번호가 올바르지 않습니다.");
@@ -2901,6 +2927,7 @@
 
         const Pipeline = ({ data, onAdd, onEdit, onDelete, updateStage, isGuest, currentUserId }) => {
             const [year, setYear] = useState(new Date().getFullYear().toString());
+            const [monthFilter, setMonthFilter] = useState('all');
             const [searchQuery, setSearchQuery] = useState('');
             const [stageFilter, setStageFilter] = useState('all');
             const [viewMode, setViewMode] = useState('list');
@@ -2926,15 +2953,16 @@
                 const matchesYear = (d.startDate && d.startDate.startsWith(year)) || 
                                     (d.targetDate && d.targetDate.startsWith(year)) || 
                                     (d.lastUpdateDate && d.lastUpdateDate.startsWith(year));
+                const matchesMonth = monthFilter === 'all' || [d.startDate, d.targetDate, d.lastUpdateDate].some((dt) => dt && dt.startsWith(monthFilter));
                 
                 const customerName = data.customers.find(c => c.id === d.customerId)?.name || '';
                 const query = searchQuery.toLowerCase();
                 const matchesSearch = d.title.toLowerCase().includes(query) || 
-                                      customerName.toLowerCase().includes(query) ||
+                                      customerName.toLowerCase().includes(query) || 
                                       d.product.toLowerCase().includes(query);
                 const matchesStage = stageFilter === 'all' || d.stage === stageFilter;
 
-                return matchesYear && matchesSearch && matchesStage;
+                return matchesYear && matchesMonth && matchesSearch && matchesStage;
             });
 
             const stages = [{id:'discovery',label:'문의/발굴',color:'bg-slate-500'},{id:'proposal',label:'견적/제안',color:'bg-blue-500'},{id:'negotiation',label:'협상/샘플',color:'bg-indigo-500'},{id:'closed',label:'수주/계약',color:'bg-emerald-500'}];
@@ -2944,7 +2972,7 @@
 
             useEffect(() => {
                 setSelectedIds((prev) => prev.filter((id) => filteredDeals.some((d) => d.id === id)));
-            }, [year, searchQuery, data.deals.length]);
+            }, [year, monthFilter, searchQuery, data.deals.length]);
 
             const toggleSelect = (id) => {
                 setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
@@ -2976,6 +3004,13 @@
                             <div className="flex gap-2">
                                 <select value={year} onChange={(e) => setYear(e.target.value)} className="text-sm bg-white text-slate-700 px-3 py-1.5 rounded-lg border border-slate-200 outline-none focus:border-brand-primary transition-colors shadow-sm font-bold">
                                     {displayYears.map(y => <option key={y} value={y}>{y}년</option>)}
+                                </select>
+                                <select value={monthFilter} onChange={(e) => setMonthFilter(e.target.value)} className="text-sm bg-white text-slate-700 px-3 py-1.5 rounded-lg border border-slate-200 outline-none focus:border-brand-primary transition-colors shadow-sm font-bold">
+                                    <option value="all">전체월</option>
+                                    {Array.from({ length: 12 }, (_, i) => {
+                                        const value = `${year}-${String(i + 1).padStart(2, '0')}`;
+                                        return <option key={value} value={value}>{i + 1}월</option>;
+                                    })}
                                 </select>
                                 <div className="relative">
                                     <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
@@ -3074,9 +3109,9 @@
                             </div>
                         </div>
                     ) : (
-                        <div className={`flex-1 grid gap-4 overflow-hidden h-full ${visibleStages.length === 1 ? 'grid-cols-1' : visibleStages.length === 2 ? 'grid-cols-2' : visibleStages.length === 3 ? 'grid-cols-3' : 'grid-cols-4'}`}>
+                        <div className={`flex-1 grid gap-4 overflow-hidden min-h-0 ${visibleStages.length === 1 ? 'grid-cols-1' : visibleStages.length === 2 ? 'grid-cols-2' : visibleStages.length === 3 ? 'grid-cols-3' : 'grid-cols-4'}`}>
                             {visibleStages.map(s => (
-                                <div key={s.id} className="bg-slate-50 rounded-xl flex flex-col h-full border border-slate-200">
+                                <div key={s.id} className="bg-slate-50 rounded-xl flex flex-col min-h-0 border border-slate-200">
                                     <div className="p-3 border-b flex justify-between bg-white/50 rounded-t-xl"><div className="flex items-center gap-2"><div className={`w-3 h-3 rounded-full ${s.color}`}></div><span className="font-bold text-slate-700">{s.label}</span></div><span className="text-xs bg-white px-2 py-0.5 rounded-full border">{filteredDeals.filter(d=>d.stage===s.id).length}</span></div>
                                     <div className="p-2 flex-1 overflow-y-auto space-y-3 custom-scrollbar">
                                         {filteredDeals.filter(d=>d.stage===s.id).map(d=>{
@@ -3130,6 +3165,7 @@
 
         const ProjectManagement = ({ data, onAdd, onEdit, onDelete, updateStatus, isGuest, currentUserId }) => {
             const [year, setYear] = useState(new Date().getFullYear().toString());
+            const [monthFilter, setMonthFilter] = useState('all');
             const [searchQuery, setSearchQuery] = useState('');
             const [statusFilter, setStatusFilter] = useState('all');
             const [viewMode, setViewMode] = useState('list');
@@ -3154,6 +3190,7 @@
             const filteredProjects = data.projects.filter(p => {
                 const matchesYear = (p.startDate && p.startDate.startsWith(year)) || 
                                     (p.dueDate && p.dueDate.startsWith(year));
+                const matchesMonth = monthFilter === 'all' || [p.startDate, p.dueDate].some((dt) => dt && dt.startsWith(monthFilter));
                 
                 const customerName = data.customers.find(c => c.id === p.customerId)?.name || '';
                 const query = searchQuery.toLowerCase();
@@ -3161,7 +3198,7 @@
                                       customerName.toLowerCase().includes(query);
                 const matchesStatus = statusFilter === 'all' || p.status === statusFilter;
 
-                return matchesYear && matchesSearch && matchesStatus;
+                return matchesYear && matchesMonth && matchesSearch && matchesStatus;
             });
 
             const stages = [
@@ -3177,7 +3214,7 @@
 
             useEffect(() => {
                 setSelectedIds((prev) => prev.filter((id) => filteredProjects.some((p) => p.id === id)));
-            }, [year, searchQuery, data.projects.length]);
+            }, [year, monthFilter, searchQuery, data.projects.length]);
 
             const toggleSelect = (id) => {
                 setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
@@ -3212,6 +3249,13 @@
                             <div className="flex gap-2">
                                 <select value={year} onChange={(e) => setYear(e.target.value)} className="text-sm bg-white text-slate-700 px-3 py-1.5 rounded-lg border border-slate-200 outline-none focus:border-brand-primary transition-colors shadow-sm font-bold">
                                     {displayYears.map(y => <option key={y} value={y}>{y}년</option>)}
+                                </select>
+                                <select value={monthFilter} onChange={(e) => setMonthFilter(e.target.value)} className="text-sm bg-white text-slate-700 px-3 py-1.5 rounded-lg border border-slate-200 outline-none focus:border-brand-primary transition-colors shadow-sm font-bold">
+                                    <option value="all">전체월</option>
+                                    {Array.from({ length: 12 }, (_, i) => {
+                                        const value = `${year}-${String(i + 1).padStart(2, '0')}`;
+                                        return <option key={value} value={value}>{i + 1}월</option>;
+                                    })}
                                 </select>
                                 <div className="relative">
                                     <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
@@ -3308,9 +3352,9 @@
                             </div>
                         </div>
                     ) : (
-                        <div className={`flex-1 grid gap-4 overflow-hidden h-full ${visibleStages.length === 1 ? 'grid-cols-1' : visibleStages.length === 2 ? 'grid-cols-2' : visibleStages.length === 3 ? 'grid-cols-3' : visibleStages.length === 4 ? 'grid-cols-4' : 'grid-cols-5'}`}>
+                        <div className={`flex-1 grid gap-4 overflow-hidden min-h-0 ${visibleStages.length === 1 ? 'grid-cols-1' : visibleStages.length === 2 ? 'grid-cols-2' : visibleStages.length === 3 ? 'grid-cols-3' : visibleStages.length === 4 ? 'grid-cols-4' : 'grid-cols-5'}`}>
                             {visibleStages.map(s => (
-                                <div key={s.id} className="bg-slate-50 rounded-xl flex flex-col h-full border border-slate-200">
+                                <div key={s.id} className="bg-slate-50 rounded-xl flex flex-col min-h-0 border border-slate-200">
                                     <div className={`p-3 border-b flex justify-between bg-white/50 rounded-t-xl border-t-4 ${s.borderColor.replace('border', 'border-t')}`}>
                                         <div className="flex items-center gap-2"><span className={`font-bold ${s.textColor}`}>{s.label}</span></div>
                                         <span className="text-xs bg-white px-2 py-0.5 rounded-full border">{filteredProjects.filter(p=>p.status===s.id).length}</span>
@@ -3566,13 +3610,6 @@
             const userId = normalize(currentUser?.id);
             const userTeam = String(currentUser?.team || currentUser?.department || "").trim();
             const userMemberId = String(currentUser?.memberDocId || "");
-            const lockMap = useMemo(() => {
-                const map = new Map();
-                (data.editLocks || []).forEach((lock) => {
-                    map.set(`${lock.collection}:${lock.itemId}`, lock);
-                });
-                return map;
-            }, [data.editLocks]);
 
             useEffect(() => {
                 setViewScope(isMaster ? 'all' : 'mine');
@@ -3597,10 +3634,22 @@
                 return isMaster;
             };
 
-            const withLock = (col, items) => (items || []).map((item) => ({
-                ...item,
-                _lock: lockMap.get(`${col}:${item.id}`) || null
-            }));
+            const withLock = (col, items) => (items || []).map((item) => {
+                const expiresMs = new Date(item?.lockExpiresAt || 0).getTime();
+                const lockActive = Number.isFinite(expiresMs) && expiresMs > Date.now();
+                return {
+                    ...item,
+                    _lock: lockActive ? {
+                        collection: col,
+                        itemId: item.id,
+                        userId: item.lockUserId || "",
+                        userName: item.lockUserName || item.lockUserId || "사용자",
+                        teamId: item.lockTeamId || "",
+                        acquiredAt: item.lockAcquiredAt || "",
+                        expiresAt: item.lockExpiresAt || ""
+                    } : null
+                };
+            });
 
             const scopedData = useMemo(() => ({
                 ...data,
@@ -3608,7 +3657,7 @@
                 deals: withLock("deals", (data.deals || []).filter((item) => canViewScopedItem(item))),
                 issues: withLock("issues", (data.issues || []).filter((item) => canViewScopedItem(item))),
                 projects: withLock("projects", (data.projects || []).filter((item) => canViewScopedItem(item)))
-            }), [data, viewScope, userId, userTeam, userMemberId, lockMap, isMaster]);
+            }), [data, viewScope, userId, userTeam, userMemberId, isMaster]);
 
             const close = () => {
                 if (activeLock?.col && activeLock?.id) {
@@ -3643,6 +3692,13 @@
             useEffect(() => {
                 const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
                     if (!firebaseUser) {
+                        sessionStorage.removeItem(AUTH_SESSION_KEY);
+                        setCurrentUser(null);
+                        setLoading(false);
+                        return;
+                    }
+                    if (!sessionStorage.getItem(AUTH_SESSION_KEY)) {
+                        await signOut(auth).catch(() => {});
                         setCurrentUser(null);
                         setLoading(false);
                         return;
@@ -3651,6 +3707,7 @@
                         const approvedUser = await resolveApprovedUser(firebaseUser);
                         if (!approvedUser) {
                             await signOut(auth);
+                            sessionStorage.removeItem(AUTH_SESSION_KEY);
                             setCurrentUser(null);
                         } else {
                             setCurrentUser(approvedUser);
@@ -3671,6 +3728,7 @@
             };
 
             const handleLogout = () => {
+                sessionStorage.removeItem(AUTH_SESSION_KEY);
                 signOut(auth).catch(() => {});
                 setCurrentUser(null);
             };
